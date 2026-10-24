@@ -8,7 +8,7 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, RestAPI, useEffect, UserStore, useState } from "@webpack/common";
 
 // Bei jedem neuen Release erhöhen (z. B. "1.0.1"), sonst erkennt das Auto-Update nichts Neues
-const VERSION = "1.0.4";
+const VERSION = "1.0.5";
 
 const Native = VencordNative.pluginHelpers.MeinPlugin as PluginNative<typeof import("./native")>;
 
@@ -132,11 +132,6 @@ const settings = definePluginSettings({
         type: OptionType.STRING,
         description: "Torwächter: Rollen-ID von „Verifiziert“ (wird von !serversetup automatisch gesetzt)",
         default: ""
-    },
-    pluginLink: {
-        type: OptionType.STRING,
-        description: "Link zum Plugin (wird als Button im Verify-Kanal angezeigt)",
-        default: "https://github.com/lukasrickes540-oss/meinplugin"
     }
 });
 
@@ -229,7 +224,7 @@ function Aufgedeckt({ message }: { message: { content: string; }; }) {
 
 /* ---------------------------------- Befehle ---------------------------------- */
 
-const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe|verify|verifybutton|serversetup)\b\s*(.*)$/is;
+const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe|verify|serversetup)\b\s*(.*)$/is;
 const uebersprungen = new Set<string>();
 
 const info = (channelId: string, content: string) => sendBotMessage(channelId, { content });
@@ -376,15 +371,6 @@ async function befehl(cmd: string, arg: string, channelId: string) {
             break;
         }
 
-        case "verifybutton": {
-            if (!TOR.kanalId) throw new Error("Kein Verify-Kanal eingestellt (zuerst !serversetup ausführen).");
-            const art = await verifyNachrichtPosten(TOR.kanalId);
-            info(channelId, art === "button"
-                ? "✅ Nachricht mit Plugin-Button im Verify-Kanal gepostet und angeheftet."
-                : "⚠️ Ein Button war nicht möglich. Ich habe stattdessen eine Nachricht mit Link gepostet.");
-            break;
-        }
-
         case "verify": {
             if (!torKonfiguriert()) throw new Error("Torwächter ist nicht eingerichtet (IDs im Code und Geheimnis in den Einstellungen).");
             letzterHandshake = 0;
@@ -406,7 +392,6 @@ async function befehl(cmd: string, arg: string, channelId: string) {
                 "`!avatar [ID]` Profilbild anzeigen",
                 "`!op` Versteckt-Modus umschalten",
                 "`!verify` Torwächter-Nachweis erneut senden",
-                "`!verifybutton` Nachricht mit Plugin-Button im Verify-Kanal posten",
                 "`!serversetup <Name>` kompletten Server mit Rollen, Kanälen und Torwächter erstellen",
                 "`!update` / `!version` Plugin aktualisieren / Version zeigen"
             ].join("\n"));
@@ -550,56 +535,6 @@ function zufallsGeheimnis(): string {
     return Array.from(bytes, b => b.toString(36).padStart(2, "0")).join("");
 }
 
-/**
- * Postet im Verify-Kanal eine Anleitung mit Link-Button.
- * Normale Accounts können keine Buttons senden, ein Webhook darf aber Link-Buttons verwenden.
- * Der Webhook wird danach wieder gelöscht. Klappt das nicht, wird eine Nachricht mit Link gepostet.
- */
-async function verifyNachrichtPosten(kanalId: string): Promise<"button" | "text"> {
-    const link = (settings.store.pluginLink ?? "").trim();
-    if (!/^https:\/\/\S+$/.test(link)) {
-        throw new Error("Kein gültiger Plugin-Link (Plugin-Einstellungen → Plugin-Link).");
-    }
-
-    const text = [
-        "👋 **Willkommen!** Dieser Server ist nur für Leute mit dem Plugin.",
-        "",
-        "1️⃣ Lade das Plugin über den Button herunter und baue es in Vencord ein.",
-        "2️⃣ Trage in den Plugin-Einstellungen das **Torwächter-Geheimnis** ein (das bekommst du von dem, der dich eingeladen hat).",
-        "3️⃣ Dein Plugin schickt hier automatisch einen Nachweis. Klappt das nicht, schreibe `!verify`.",
-        "",
-        "Danach wirst du automatisch freigeschaltet, sobald der Server-Besitzer online ist."
-    ].join("\n");
-
-    try {
-        const hook = (await RestAPI.post({ url: `/channels/${kanalId}/webhooks`, body: { name: "Torwächter" } })).body;
-        try {
-            const res = await RestAPI.post({
-                url: `/webhooks/${hook.id}/${hook.token}`,
-                query: { with_components: "true", wait: "true" },
-                body: {
-                    username: "Torwächter",
-                    content: text,
-                    components: [{
-                        type: 1,
-                        components: [{ type: 2, style: 5, label: "Plugin herunterladen", url: link }]
-                    }]
-                }
-            });
-            await RestAPI.put({ url: `/channels/${kanalId}/pins/${res.body.id}` }).catch(() => { });
-            return "button";
-        } finally {
-            await RestAPI.delete({ url: `/webhooks/${hook.id}` }).catch(() => { });
-        }
-    } catch {
-        // Fallback: normale Nachricht mit Link
-        const content = `${text}\n\n🔗 Plugin: ${link}`;
-        uebersprungen.add(content); // nicht verschlüsseln
-        await sendMessage(kanalId, { content });
-        return "text";
-    }
-}
-
 async function serverErstellen(name: string, channelId: string) {
     const sag = (text: string) => info(channelId, text);
     const post = async (url: string, body: any) => {
@@ -700,20 +635,11 @@ async function serverErstellen(name: string, channelId: string) {
         }
         torStart();
 
-        // Anleitung mit Plugin-Button im Verify-Kanal posten
-        const art = await verifyNachrichtPosten(verifyId).catch(() => null);
-        const verifyInfo = art === "button"
-            ? "🔘 Im Kanal verify steht eine Anleitung mit Plugin-Button (angeheftet)."
-            : art === "text"
-                ? "📝 Im Kanal verify steht eine Anleitung mit Plugin-Link (ein Button war nicht möglich)."
-                : "⚠️ Die Anleitung im Verify-Kanal konnte nicht gepostet werden. Nutze später !verifybutton.";
-
         sag([
             `✅ Server „${name}“ ist fertig!`,
             `🔗 Einladung (in die Zwischenablage kopiert): ${link}`,
             "👥 Rollen: Admin (du), Moderator, Verifiziert",
             "📁 Kanäle: verify, allgemein, befehle, mod-chat und 2 Sprachkanäle",
-            verifyInfo,
             `🔑 Torwächter-Geheimnis: ${geheimnis}`,
             "(nur an Leute weitergeben, die auf den Server sollen)",
             "",
