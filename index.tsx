@@ -5,10 +5,10 @@ import { showNotification } from "@api/Notifications";
 import { definePluginSettings } from "@api/Settings";
 import { sendMessage } from "@utils/discord";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
-import { ChannelStore, FluxDispatcher, RestAPI, useEffect, useState } from "@webpack/common";
+import { ChannelStore, FluxDispatcher, RestAPI, useEffect, UserStore, useState } from "@webpack/common";
 
 // Bei jedem neuen Release erhöhen (z. B. "1.0.1"), sonst erkennt das Auto-Update nichts Neues
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 
 const Native = VencordNative.pluginHelpers.MeinPlugin as PluginNative<typeof import("./native")>;
 
@@ -184,13 +184,21 @@ function Aufgedeckt({ message }: { message: { content: string; }; }) {
 
 /* ---------------------------------- Befehle ---------------------------------- */
 
-const CMD_RE = /^!(gg|op|softban|update|version)\b\s*(.*)$/is;
+const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe)\b\s*(.*)$/is;
 const uebersprungen = new Set<string>();
 
 const info = (channelId: string, content: string) => sendBotMessage(channelId, { content });
 
 function fehlerText(e: any): string {
     return e?.body?.message ?? e?.message ?? String(e);
+}
+
+/** Akzeptiert eine Nutzer-ID oder eine Erwähnung (<@123...>) als erstes Wort */
+function nutzerId(text: string): string {
+    const token = (text ?? "").trim().split(/\s+/)[0] ?? "";
+    const m = /^<@!?(\d{17,20})>$/.exec(token) ?? /^(\d{17,20})$/.exec(token);
+    if (!m) throw new Error("Bitte eine gültige Nutzer-ID oder Erwähnung angeben.");
+    return m[1];
 }
 
 async function befehl(cmd: string, arg: string, channelId: string) {
@@ -211,13 +219,126 @@ async function befehl(cmd: string, arg: string, channelId: string) {
 
         case "softban": {
             if (!guildId) throw new Error("Nur auf Servern möglich.");
-            const id = arg.split(/\s+/)[0];
-            if (!/^\d{17,20}$/.test(id)) throw new Error("Nutzung: !softban <Nutzer-ID>");
+            const id = nutzerId(arg);
 
             // Bannen (löscht Nachrichten der letzten 7 Tage) und direkt wieder entbannen
             await RestAPI.put({ url: `/guilds/${guildId}/bans/${id}`, body: { delete_message_seconds: 604800 } });
             await RestAPI.delete({ url: `/guilds/${guildId}/bans/${id}` });
             info(channelId, `🔨 Softban für <@${id}> durchgeführt (Nachrichten der letzten 7 Tage gelöscht, Nutzer kann wieder beitreten).`);
+            break;
+        }
+
+        case "kick": {
+            if (!guildId) throw new Error("Nur auf Servern möglich.");
+            const id = nutzerId(arg);
+            await RestAPI.delete({ url: `/guilds/${guildId}/members/${id}` });
+            info(channelId, `👢 <@${id}> wurde gekickt.`);
+            break;
+        }
+
+        case "ban": {
+            if (!guildId) throw new Error("Nur auf Servern möglich.");
+            const id = nutzerId(arg);
+            await RestAPI.put({ url: `/guilds/${guildId}/bans/${id}`, body: { delete_message_seconds: 0 } });
+            info(channelId, `⛔ <@${id}> wurde gebannt.`);
+            break;
+        }
+
+        case "unban": {
+            if (!guildId) throw new Error("Nur auf Servern möglich.");
+            const id = nutzerId(arg);
+            await RestAPI.delete({ url: `/guilds/${guildId}/bans/${id}` });
+            info(channelId, `✅ <@${id}> wurde entbannt.`);
+            break;
+        }
+
+        case "mute": {
+            if (!guildId) throw new Error("Nur auf Servern möglich.");
+            const [idText, minText] = arg.split(/\s+/);
+            const id = nutzerId(idText);
+            const minuten = Math.floor(Number(minText));
+            if (!Number.isFinite(minuten) || minuten < 1 || minuten > 40320) {
+                throw new Error("Nutzung: !mute <ID> <Minuten, 1 bis 40320>");
+            }
+            await RestAPI.patch({
+                url: `/guilds/${guildId}/members/${id}`,
+                body: { communication_disabled_until: new Date(Date.now() + minuten * 60_000).toISOString() }
+            });
+            info(channelId, `🔇 <@${id}> ist für ${minuten} Minuten stummgeschaltet.`);
+            break;
+        }
+
+        case "unmute": {
+            if (!guildId) throw new Error("Nur auf Servern möglich.");
+            const id = nutzerId(arg);
+            await RestAPI.patch({
+                url: `/guilds/${guildId}/members/${id}`,
+                body: { communication_disabled_until: null }
+            });
+            info(channelId, `🔊 <@${id}> ist nicht mehr stummgeschaltet.`);
+            break;
+        }
+
+        case "purge": {
+            const anzahl = Math.floor(Number(arg.split(/\s+/)[0]));
+            if (!Number.isFinite(anzahl) || anzahl < 1 || anzahl > 100) {
+                throw new Error("Nutzung: !purge <Anzahl, 1 bis 100>");
+            }
+            const res = await RestAPI.get({ url: `/channels/${channelId}/messages`, query: { limit: anzahl } });
+            // Discord erlaubt Massenlöschen nur für Nachrichten der letzten 14 Tage
+            const grenze = Date.now() - 13 * 24 * 3_600_000;
+            const ids: string[] = res.body
+                .filter((m: any) => new Date(m.timestamp).getTime() > grenze)
+                .map((m: any) => m.id);
+
+            if (!ids.length) throw new Error("Keine löschbaren Nachrichten gefunden (nur die letzten 13 Tage).");
+
+            if (ids.length === 1) {
+                await RestAPI.delete({ url: `/channels/${channelId}/messages/${ids[0]}` });
+            } else {
+                await RestAPI.post({ url: `/channels/${channelId}/messages/bulk-delete`, body: { messages: ids } });
+            }
+            info(channelId, `🧹 ${ids.length} Nachrichten gelöscht.`);
+            break;
+        }
+
+        case "avatar": {
+            const id = arg.trim() ? nutzerId(arg) : UserStore.getCurrentUser().id;
+            const res = await RestAPI.get({ url: `/users/${id}` });
+            const u = res.body;
+            const bild = u.avatar
+                ? `https://cdn.discordapp.com/avatars/${u.id}/${u.avatar}.${u.avatar.startsWith("a_") ? "gif" : "png"}?size=1024`
+                : `https://cdn.discordapp.com/embed/avatars/${Number((BigInt(u.id) >> 22n) % 6n)}.png`;
+            info(channelId, `🖼️ Profilbild von ${u.username}:\n${bild}`);
+            break;
+        }
+
+        case "invites": {
+            if (!guildId) throw new Error("Nur auf Servern möglich.");
+            const res = await RestAPI.get({ url: `/guilds/${guildId}/invites` });
+            const liste: string[] = res.body.slice(0, 15).map((i: any) =>
+                `• discord.gg/${i.code} (${i.uses}${i.max_uses ? `/${i.max_uses}` : ""} Nutzungen${i.inviter ? `, von ${i.inviter.username}` : ""})`
+            );
+            info(channelId, liste.length
+                ? `📨 Aktive Einladungen (${res.body.length}):\n${liste.join("\n")}`
+                : "📨 Es gibt keine aktiven Einladungen.");
+            break;
+        }
+
+        case "hilfe": {
+            info(channelId, [
+                "📖 **Befehle**",
+                "`!gg` Einladungslink erstellen",
+                "`!invites` aktive Einladungen anzeigen",
+                "`!kick <ID>` Nutzer kicken",
+                "`!ban <ID>` / `!unban <ID>` bannen / entbannen",
+                "`!softban <ID>` bannen und sofort entbannen (löscht Nachrichten)",
+                "`!mute <ID> <Minuten>` / `!unmute <ID>` Timeout setzen / aufheben",
+                "`!purge <Anzahl>` letzte Nachrichten im Kanal löschen",
+                "`!avatar [ID]` Profilbild anzeigen",
+                "`!op` Versteckt-Modus umschalten",
+                "`!update` / `!version` Plugin aktualisieren / Version zeigen"
+            ].join("\n"));
             break;
         }
 
