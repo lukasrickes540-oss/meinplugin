@@ -8,7 +8,7 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { ChannelStore, FluxDispatcher, RestAPI, useEffect, useState } from "@webpack/common";
 
 // Bei jedem neuen Release erhöhen (z. B. "1.0.1"), sonst erkennt das Auto-Update nichts Neues
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 
 const Native = VencordNative.pluginHelpers.MeinPlugin as PluginNative<typeof import("./native")>;
 
