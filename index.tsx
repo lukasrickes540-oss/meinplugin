@@ -8,19 +8,19 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, RestAPI, useEffect, UserStore, useState } from "@webpack/common";
 
 // Bei jedem neuen Release erhöhen (z. B. "1.0.1"), sonst erkennt das Auto-Update nichts Neues
-const VERSION = "1.0.5";
+const VERSION = "1.0.7";
 
 const Native = VencordNative.pluginHelpers.MeinPlugin as PluginNative<typeof import("./native")>;
 
 // Torwächter: Diese Standardwerte bekommen alle, die das Plugin von dir erhalten.
-// Trage hier die IDs ein, die dir !serversetup ausgibt, BEVOR du die Datei auf GitHub hochlädst.
+// Trage hier die IDs deines Servers ein, BEVOR du die Datei auf GitHub hochlädst.
 const TOR_STANDARD = {
     serverId: "", // ID deines Discord-Servers
     kanalId: "",  // ID des Verify-Kanals
     rolleId: ""   // ID der Rolle "Verifiziert"
 };
 
-// Eigene Einstellungen (von !serversetup automatisch gesetzt) haben Vorrang vor den Standardwerten
+// Eigene Einstellungen haben Vorrang vor den Standardwerten
 const TOR = {
     get serverId(): string { return settings.store.torServerId || TOR_STANDARD.serverId; },
     get kanalId(): string { return settings.store.torKanalId || TOR_STANDARD.kanalId; },
@@ -120,17 +120,17 @@ const settings = definePluginSettings({
     },
     torServerId: {
         type: OptionType.STRING,
-        description: "Torwächter: Server-ID (wird von !serversetup automatisch gesetzt)",
+        description: "Torwächter: Server-ID (leer = Standardwert aus dem Code)",
         default: ""
     },
     torKanalId: {
         type: OptionType.STRING,
-        description: "Torwächter: Verify-Kanal-ID (wird von !serversetup automatisch gesetzt)",
+        description: "Torwächter: Verify-Kanal-ID (leer = Standardwert aus dem Code)",
         default: ""
     },
     torRolleId: {
         type: OptionType.STRING,
-        description: "Torwächter: Rollen-ID von „Verifiziert“ (wird von !serversetup automatisch gesetzt)",
+        description: "Torwächter: Rollen-ID von „Verifiziert“ (leer = Standardwert aus dem Code)",
         default: ""
     }
 });
@@ -224,7 +224,7 @@ function Aufgedeckt({ message }: { message: { content: string; }; }) {
 
 /* ---------------------------------- Befehle ---------------------------------- */
 
-const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe|verify|serversetup)\b\s*(.*)$/is;
+const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe)\b\s*(.*)$/is;
 const uebersprungen = new Set<string>();
 
 const info = (channelId: string, content: string) => sendBotMessage(channelId, { content });
@@ -365,20 +365,6 @@ async function befehl(cmd: string, arg: string, channelId: string) {
             break;
         }
 
-        case "serversetup": {
-            // Nicht abwarten, sonst blockiert es das Chatfeld
-            void serverErstellen(arg.trim().slice(0, 100) || "Mein Server", channelId);
-            break;
-        }
-
-        case "verify": {
-            if (!torKonfiguriert()) throw new Error("Torwächter ist nicht eingerichtet (IDs im Code und Geheimnis in den Einstellungen).");
-            letzterHandshake = 0;
-            await handshakeSenden();
-            info(channelId, "🛂 Nachweis an den Verify-Kanal gesendet. Wenn der Server-Besitzer online ist, wirst du gleich freigeschaltet.");
-            break;
-        }
-
         case "hilfe": {
             info(channelId, [
                 "📖 **Befehle**",
@@ -391,8 +377,6 @@ async function befehl(cmd: string, arg: string, channelId: string) {
                 "`!purge <Anzahl>` letzte Nachrichten im Kanal löschen",
                 "`!avatar [ID]` Profilbild anzeigen",
                 "`!op` Versteckt-Modus umschalten",
-                "`!verify` Torwächter-Nachweis erneut senden",
-                "`!serversetup <Name>` kompletten Server mit Rollen, Kanälen und Torwächter erstellen",
                 "`!update` / `!version` Plugin aktualisieren / Version zeigen"
             ].join("\n"));
             break;
@@ -512,147 +496,6 @@ function aktualisiereHintergrund() {
         }
     `;
     document.head.append(hintergrundStyle);
-}
-
-/* ------------------------------ Server automatisch erstellen ------------------------------ */
-
-const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
-const BIT = (n: number) => 1n << BigInt(n);
-
-// Rechte (Discord-Bitwerte)
-const RECHTE_BASIS = BIT(6) | BIT(10) | BIT(11) | BIT(14) | BIT(15) | BIT(16) | BIT(18) | BIT(20)
-    | BIT(21) | BIT(25) | BIT(26) | BIT(31) | BIT(35);
-const RECHTE_MOD = RECHTE_BASIS | BIT(1) | BIT(2) | BIT(7) | BIT(13) | BIT(22) | BIT(23) | BIT(24)
-    | BIT(27) | BIT(34) | BIT(40);
-const RECHTE_ADMIN = BIT(3);
-const RECHTE_VERIFY = BIT(10) | BIT(11) | BIT(16);
-
-const overwrite = (id: string, allow: bigint, deny: bigint) =>
-    ({ id, type: 0, allow: allow.toString(), deny: deny.toString() });
-
-function zufallsGeheimnis(): string {
-    const bytes = crypto.getRandomValues(new Uint8Array(18));
-    return Array.from(bytes, b => b.toString(36).padStart(2, "0")).join("");
-}
-
-async function serverErstellen(name: string, channelId: string) {
-    const sag = (text: string) => info(channelId, text);
-    const post = async (url: string, body: any) => {
-        await sleep(400); // Pausen gegen Rate-Limits
-        return (await RestAPI.post({ url, body })).body;
-    };
-
-    try {
-        sag(`🏗️ Erstelle den Server „${name}“ … das dauert etwa 30 Sekunden.`);
-
-        const guild = await post("/guilds", { name, icon: null });
-        const gid: string = guild.id;
-
-        // Rollen (zuerst Admin, dann Moderator, dann Verifiziert)
-        const admin = await post(`/guilds/${gid}/roles`, { name: "Admin", permissions: RECHTE_ADMIN.toString(), color: 0xE74C3C, hoist: true });
-        const mod = await post(`/guilds/${gid}/roles`, { name: "Moderator", permissions: RECHTE_MOD.toString(), color: 0x3498DB, hoist: true });
-        const verifiziert = await post(`/guilds/${gid}/roles`, { name: "Verifiziert", permissions: RECHTE_BASIS.toString(), color: 0x2ECC71 });
-
-        // @everyone darf nichts sehen, nur der Verify-Kanal wird freigegeben
-        await sleep(400);
-        await RestAPI.patch({ url: `/guilds/${gid}/roles/${gid}`, body: { permissions: "0" } });
-
-        // Reihenfolge der Rollen festlegen (Admin oben)
-        await sleep(400);
-        await RestAPI.patch({
-            url: `/guilds/${gid}/roles`,
-            body: [
-                { id: admin.id, position: 3 },
-                { id: mod.id, position: 2 },
-                { id: verifiziert.id, position: 1 }
-            ]
-        }).catch(() => { });
-
-        // Kanäle
-        const neu = new Set<string>();
-        const anlegen = async (kanalName: string, type: number, parent?: string, overwrites?: any[]): Promise<string> => {
-            const c = await post(`/guilds/${gid}/channels`, {
-                name: kanalName,
-                type,
-                parent_id: parent,
-                permission_overwrites: overwrites
-            });
-            neu.add(c.id);
-            return c.id;
-        };
-
-        const katZugang = await anlegen("Zugang", 4);
-        const verifyId = await anlegen("verify", 0, katZugang, [
-            overwrite(gid, RECHTE_VERIFY, 0n),       // alle dürfen hier sehen und schreiben
-            overwrite(verifiziert.id, 0n, BIT(10))   // nach der Freischaltung wird der Kanal ausgeblendet
-        ]);
-
-        const katChat = await anlegen("Chat", 4);
-        const allgemeinId = await anlegen("allgemein", 0, katChat);
-        await anlegen("befehle", 0, katChat);
-
-        const katSprache = await anlegen("Sprache", 4);
-        await anlegen("Allgemein", 2, katSprache);
-        await anlegen("Musik", 2, katSprache);
-
-        const teamRechte = [
-            overwrite(gid, 0n, BIT(10)),
-            overwrite(verifiziert.id, 0n, BIT(10)),
-            overwrite(mod.id, BIT(10), 0n)
-        ];
-        const katTeam = await anlegen("Team", 4, undefined, teamRechte);
-        await anlegen("mod-chat", 0, katTeam, teamRechte);
-
-        // Standardkanäle, die Discord automatisch angelegt hat, wieder löschen
-        await sleep(400);
-        const alle: any[] = (await RestAPI.get({ url: `/guilds/${gid}/channels` })).body;
-        for (const c of alle) {
-            if (neu.has(c.id)) continue;
-            await sleep(400);
-            await RestAPI.delete({ url: `/channels/${c.id}` }).catch(() => { });
-        }
-
-        // Dir selbst die Admin-Rolle geben
-        await sleep(400);
-        await RestAPI.put({ url: `/guilds/${gid}/members/${UserStore.getCurrentUser().id}/roles/${admin.id}` }).catch(() => { });
-
-        // Einladungslink (unbegrenzt) für den Verify-Kanal
-        const einladung = await post(`/channels/${verifyId}/invites`, { max_age: 0, max_uses: 0, unique: true });
-        const link = `https://discord.gg/${einladung.code}`;
-        navigator.clipboard.writeText(link).catch(() => { });
-
-        // Torwächter und Willkommensnachricht automatisch einrichten
-        settings.store.torServerId = gid;
-        settings.store.torKanalId = verifyId;
-        settings.store.torRolleId = verifiziert.id;
-        settings.store.willkommenKanalId = allgemeinId;
-        settings.store.torwaechter = true;
-
-        let geheimnis = settings.store.torGeheimnis;
-        if (!geheimnis) {
-            geheimnis = zufallsGeheimnis();
-            settings.store.torGeheimnis = geheimnis;
-        }
-        torStart();
-
-        sag([
-            `✅ Server „${name}“ ist fertig!`,
-            `🔗 Einladung (in die Zwischenablage kopiert): ${link}`,
-            "👥 Rollen: Admin (du), Moderator, Verifiziert",
-            "📁 Kanäle: verify, allgemein, befehle, mod-chat und 2 Sprachkanäle",
-            `🔑 Torwächter-Geheimnis: ${geheimnis}`,
-            "(nur an Leute weitergeben, die auf den Server sollen)",
-            "",
-            "Damit auch andere das Plugin mit den richtigen IDs bekommen, trage diese Zeilen im Code bei TOR_STANDARD ein, bevor du das Update hochlädst:",
-            "```ts",
-            `serverId: "${gid}",`,
-            `kanalId: "${verifyId}",`,
-            `rolleId: "${verifiziert.id}"`,
-            "```"
-        ].join("\n"));
-    } catch (e) {
-        sag(`❌ Server-Erstellung fehlgeschlagen: ${fehlerText(e)}\nFalls dabei schon ein Server entstanden ist, lösche ihn in Discord und versuche es noch einmal.`);
-    }
 }
 
 /* ------------------------------------ Torwächter ------------------------------------ */
