@@ -3,12 +3,13 @@ import { addMessageAccessory, removeMessageAccessory } from "@api/MessageAccesso
 import { addMessagePreSendListener, MessageSendListener, removeMessagePreSendListener } from "@api/MessageEvents";
 import { showNotification } from "@api/Notifications";
 import { definePluginSettings } from "@api/Settings";
+import { findStoreLazy } from "@webpack";
 import { sendMessage } from "@utils/discord";
 import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, RestAPI, useEffect, UserStore, useState } from "@webpack/common";
 
 // Bei jedem neuen Release erhöhen (z. B. "1.0.1"), sonst erkennt das Auto-Update nichts Neues
-const VERSION = "1.2.1";
+const VERSION = "1.2.2";
 
 const Native = VencordNative.pluginHelpers.MeinPlugin as PluginNative<typeof import("./native")>;
 
@@ -625,6 +626,40 @@ function aktualisiereHintergrund() {
 
 /* ------------------------------ Erweitertes Audit-Log ------------------------------ */
 
+// Discord hat die Rollen in einen eigenen Speicher ausgelagert (je nach Version unterschiedlich benannt)
+const GuildRoleStore = findStoreLazy("GuildRoleStore");
+
+/** Alle Rollen eines Servers als Objekt { Rollen-ID: Rolle } */
+function rollenVon(guildId: string): Record<string, any> {
+    try {
+        const r = GuildRoleStore.getRolesSnapshot?.(guildId) ?? GuildRoleStore.getRoles?.(guildId);
+        if (r) return r;
+    } catch {
+        // weiter mit dem Ersatzweg
+    }
+    try {
+        const r = (GuildStore as any).getRoles?.(guildId) ?? (GuildStore as any).getGuild?.(guildId)?.roles;
+        if (r) return r;
+    } catch {
+        // keine Rollen bekannt
+    }
+    return {};
+}
+
+/** Alle dem Client bekannten Mitglieder eines Servers (Nutzer-ID und Rollen) */
+function mitgliederVon(guildId: string): { userId: string; roles: string[]; }[] {
+    const store = GuildMemberStore as any;
+    try {
+        const liste = store.getMembers?.(guildId);
+        if (Array.isArray(liste)) return liste;
+        const ids: string[] | undefined = store.getMemberIds?.(guildId);
+        if (ids) return ids.map(id => store.getMember(guildId, id)).filter(Boolean);
+    } catch {
+        // keine Mitglieder bekannt
+    }
+    return [];
+}
+
 type AuditNachricht = {
     id: string;
     autorId: string;
@@ -870,7 +905,7 @@ function auditMassenLoeschung({ ids, channelId, guildId }: any) {
 /* --- Rollenänderungen --- */
 
 function rollenName(guildId: string, roleId: string): string {
-    const rolle = GuildStore.getRole?.(guildId, roleId) ?? GuildStore.getRoles?.(guildId)?.[roleId];
+    const rolle = rollenVon(guildId)[roleId];
     return entschaerfen(rolle?.name ?? roleId);
 }
 
@@ -878,7 +913,7 @@ function rollenVorladen() {
     const gid = settings.store.auditServerId;
     if (!auditBereit() || !gid) return;
     try {
-        for (const m of GuildMemberStore.getMembers(gid) ?? []) {
+        for (const m of mitgliederVon(gid)) {
             rollenCache.set(`${gid}:${m.userId}`, [...(m.roles ?? [])]);
         }
     } catch (e) {
@@ -1009,7 +1044,7 @@ async function serverKopieren(quellId: string, wunschName: string, channelId: st
         const quellName: string | undefined = GuildStore.getGuild(quellId)?.name;
         if (!quellName) throw new Error("Diesen Server kenne ich nicht. Du musst Mitglied sein, und die ID muss stimmen.");
 
-        const rollen = Object.values(GuildStore.getRoles(quellId) ?? {}) as any[];
+        const rollen = Object.values(rollenVon(quellId)) as any[];
         const everyoneQuelle = rollen.find(r => r.id === quellId);
         const kopierbar = rollen
             .filter(r => r.id !== quellId && !r.managed)
@@ -1178,7 +1213,7 @@ function zoneKanalMerken(z: Zone, kanalId: string | undefined) {
 
 function rolleFinden(guildId: string, text: string): string {
     const t = text.trim();
-    const rollen = Object.values(GuildStore.getRoles(guildId) ?? {}) as any[];
+    const rollen = Object.values(rollenVon(guildId)) as any[];
     const treffer = /^\d{17,20}$/.test(t)
         ? rollen.find(r => r.id === t)
         : rollen.find(r => String(r.name).toLowerCase() === t.toLowerCase());
@@ -1198,7 +1233,7 @@ function zoneText(z: Zone): string {
 
 function zonenMitglieder(guildId: string): Map<string, string[]> {
     const map = new Map<string, string[]>();
-    for (const m of GuildMemberStore.getMembers(guildId) ?? []) map.set(m.userId, m.roles ?? []);
+    for (const m of mitgliederVon(guildId)) map.set(m.userId, m.roles ?? []);
     return map;
 }
 
@@ -1349,7 +1384,7 @@ async function zoneAuto(name: string, anzahl: number, channelId: string, guildId
 
     info(channelId, `🌫️ Richte die Zone „${entschaerfen(name)}“ ein und lege ${anzahl} Rollen an …`);
 
-    const bestehende = Object.values(GuildStore.getRoles(guildId) ?? {}) as any[];
+    const bestehende = Object.values(rollenVon(guildId)) as any[];
     const rollenIds: string[] = [];
     const rollenNamen: string[] = [];
 
