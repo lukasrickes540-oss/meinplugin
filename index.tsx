@@ -8,7 +8,7 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, RestAPI, useEffect, UserStore, useState } from "@webpack/common";
 
 // Bei jedem neuen Release erhöhen (z. B. "1.0.1"), sonst erkennt das Auto-Update nichts Neues
-const VERSION = "1.2.0";
+const VERSION = "1.2.1";
 
 const Native = VencordNative.pluginHelpers.MeinPlugin as PluginNative<typeof import("./native")>;
 
@@ -501,7 +501,7 @@ async function befehl(cmd: string, arg: string, channelId: string) {
                 "`!op` Versteckt-Modus umschalten",
                 "`!auditlog` Protokoll in diesem Kanal einschalten (`!auditlog aus` / `!auditlog status`)",
                 "`!serverkopie <Server-ID> [Name]` Struktur eines Servers (Rollen, Kanäle, Rechte) kopieren",
-                "`!zone neu <Name> <Rolle+Rolle | Rolle>` Kanal, der nur existiert, solange die Bedingung gilt (auch `!zone liste`, `!zone loeschen`, `!zone pruefen`)",
+                "`!zone neu <Name>` Unsichtbare Zone komplett automatisch einrichten, `!zone mit <Name> @A @B` verteilt die Rollen (mehr mit `!zone`)",
                 "`!update` / `!version` Plugin aktualisieren / Version zeigen"
             ].join("\n"));
             break;
@@ -1337,12 +1337,68 @@ function zonenStop() {
     zonenIntervall = null;
 }
 
+/** Richtet eine Zone komplett automatisch ein: legt die nötigen Rollen an und registriert die Zone */
+async function zoneAuto(name: string, anzahl: number, channelId: string, guildId: string | undefined) {
+    if (!guildId) throw new Error("Nur auf Servern möglich.");
+    if (name.length > 90) throw new Error("Der Name ist zu lang (höchstens 90 Zeichen).");
+
+    const liste = zonenLaden();
+    if (liste.some(z => z.guildId === guildId && z.name.toLowerCase() === name.toLowerCase())) {
+        throw new Error("Eine Zone mit diesem Namen gibt es auf diesem Server schon.");
+    }
+
+    info(channelId, `🌫️ Richte die Zone „${entschaerfen(name)}“ ein und lege ${anzahl} Rollen an …`);
+
+    const bestehende = Object.values(GuildStore.getRoles(guildId) ?? {}) as any[];
+    const rollenIds: string[] = [];
+    const rollenNamen: string[] = [];
+
+    for (let i = 1; i <= anzahl; i++) {
+        const rollenName = `${name}-${i}`;
+        rollenNamen.push(rollenName);
+
+        const vorhanden = bestehende.find(r => String(r.name).toLowerCase() === rollenName.toLowerCase());
+        if (vorhanden) {
+            rollenIds.push(vorhanden.id);
+            continue;
+        }
+
+        await pause(400);
+        const neu = (await anfrage(() => RestAPI.post({
+            url: `/guilds/${guildId}/roles`,
+            body: { name: rollenName, permissions: "0", mentionable: false }
+        }))).body;
+        rollenIds.push(neu.id);
+    }
+
+    const aktuell = zonenLaden();
+    aktuell.push({ name, guildId, slots: rollenIds.map(id => [id]) });
+    zonenSpeichern(aktuell);
+    zonenPlanen(500);
+
+    info(channelId, [
+        `✅ Zone „${entschaerfen(name)}“ ist eingerichtet.`,
+        `🏷️ Rollen: ${rollenNamen.map(entschaerfen).join(", ")}`,
+        `Der Kanal „${zonenKanalName(name)}“ erscheint automatisch, sobald **alle ${anzahl} Rollen an verschiedene Personen vergeben sind**, und verschwindet, wenn eine fehlt. Sichtbar ist er nur für diese Personen.`,
+        `Rollen automatisch verteilen: \`!zone mit ${name} ${Array.from({ length: anzahl }, (_, i) => `@Person${i + 1}`).join(" ")}\``
+    ].join("\n"));
+}
+
 async function zonenBefehl(arg: string, channelId: string, guildId: string | undefined) {
     const nutzung = [
-        "Nutzung: `!zone neu <Name> <Bedingung>` | `!zone liste` | `!zone loeschen <Name>` | `!zone pruefen`",
-        "Bedingung: Rollen mit + verbinden (eine Person hat alle), Personen mit | trennen.",
-        "Beispiel: `!zone neu geheimraum Mod+Aktiv | Admin`"
+        "**Am einfachsten (alles automatisch):**",
+        "`!zone neu geheimraum` legt zwei Rollen und die Zone an. Mit `!zone neu geheimraum 3` sind es drei Personen.",
+        "`!zone mit geheimraum @Person1 @Person2` verteilt die Rollen an die Personen.",
+        "**Eigene Bedingung:** `!zone neu <Name> <Bedingung>`. Rollen mit + verbinden (eine Person hat alle), Personen mit | trennen, zum Beispiel `!zone neu geheimraum Mod+Aktiv | Admin`.",
+        "Weitere Befehle: `!zone liste`, `!zone loeschen <Name>`, `!zone pruefen`"
     ].join("\n");
+
+    // "!zone neu <Name>" oder "!zone neu <Name> 3": alles automatisch einrichten
+    const auto = /^(?:neu|auto)\s+(\S+)(?:\s+([2-4]))?\s*$/is.exec(arg);
+    if (auto) {
+        await zoneAuto(auto[1], Number(auto[2] ?? 2), channelId, guildId);
+        return;
+    }
 
     const neu = /^neu\s+(\S+)\s+(.+)$/is.exec(arg);
     if (neu) {
@@ -1390,6 +1446,27 @@ async function zonenBefehl(arg: string, channelId: string, guildId: string | und
                 await anfrage(() => RestAPI.delete({ url: `/channels/${weg.kanalId}` })).catch(() => { });
             }
             info(channelId, `🗑️ Zone „${entschaerfen(weg.name)}“ gelöscht.`);
+            return;
+        }
+
+        case "mit": {
+            if (!name) throw new Error(nutzung);
+            const personen = arg.split(/\s+/).slice(2);
+            const zone = zonenLaden().find(z => z.name.toLowerCase() === name.toLowerCase() && (!guildId || z.guildId === guildId));
+            if (!zone) throw new Error(`Zone „${name}“ nicht gefunden.`);
+            if (personen.length !== zone.slots.length) {
+                throw new Error(`Diese Zone braucht genau ${zone.slots.length} Personen, du hast ${personen.length} angegeben.`);
+            }
+
+            for (let i = 0; i < personen.length; i++) {
+                const id = nutzerId(personen[i]);
+                for (const rolle of zone.slots[i]) {
+                    await pause(400);
+                    await anfrage(() => RestAPI.put({ url: `/guilds/${zone.guildId}/members/${id}/roles/${rolle}` }));
+                }
+            }
+            zonenPlanen(1500);
+            info(channelId, `✅ Rollen verteilt. Wenn alle Plätze besetzt sind, erscheint der Kanal „${zonenKanalName(zone.name)}“ gleich automatisch.`);
             return;
         }
 
