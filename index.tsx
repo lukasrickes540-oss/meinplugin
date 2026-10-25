@@ -8,7 +8,7 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, RestAPI, useEffect, UserStore, useState } from "@webpack/common";
 
 // Bei jedem neuen Release erhöhen (z. B. "1.0.1"), sonst erkennt das Auto-Update nichts Neues
-const VERSION = "1.0.8";
+const VERSION = "1.1.0";
 
 const Native = VencordNative.pluginHelpers.MeinPlugin as PluginNative<typeof import("./native")>;
 
@@ -37,26 +37,13 @@ const settings = definePluginSettings({
     },
     passwort: {
         type: OptionType.STRING,
-        description: "Gemeinsames Passwort. Wer es kennt, kann deine geschützten Nachrichten lesen (mit Plugin automatisch, ohne Plugin über die Entschlüsselungsseite).",
+        description: "Gemeinsames Passwort. Nur wer dasselbe Passwort + das Plugin hat, kann mitlesen.",
         default: "bitte-aendern"
     },
     tarntext: {
         type: OptionType.STRING,
         description: "Text, den Leute OHNE Plugin stattdessen sehen",
         default: "."
-    },
-    opModus: {
-        type: OptionType.SELECT,
-        description: "Was passiert nach !op (Versteckt-Modus aus)?",
-        options: [
-            { label: "Mit Passwort: sichtbar, aber ohne Plugin nur mit Passwort lesbar", value: "passwort", default: true },
-            { label: "Offen: für alle ganz normal lesbar", value: "offen" }
-        ]
-    },
-    entschluesselnLink: {
-        type: OptionType.STRING,
-        description: "Link zur Entschlüsselungsseite (entschluesseln.html) für Leute ohne Plugin",
-        default: "https://lukasrickes540-oss.github.io/meinplugin/entschluesseln.html"
     },
     einladungStunden: {
         type: OptionType.NUMBER,
@@ -145,6 +132,36 @@ const settings = definePluginSettings({
         type: OptionType.STRING,
         description: "Torwächter: Rollen-ID von „Verifiziert“ (leer = Standardwert aus dem Code)",
         default: ""
+    },
+    auditAktiv: {
+        type: OptionType.BOOLEAN,
+        description: "Audit-Log: Gelöschte/bearbeitete Nachrichten und Rollenänderungen in den Admin-Kanal schreiben (einrichten mit !auditlog)",
+        default: false
+    },
+    auditServerId: {
+        type: OptionType.STRING,
+        description: "Audit-Log: ID des überwachten Servers (wird von !auditlog gesetzt)",
+        default: ""
+    },
+    auditKanalId: {
+        type: OptionType.STRING,
+        description: "Audit-Log: ID des Admin-Kanals für das Protokoll (wird von !auditlog gesetzt)",
+        default: ""
+    },
+    auditLoeschen: {
+        type: OptionType.BOOLEAN,
+        description: "Audit-Log: Gelöschte Nachrichten protokollieren",
+        default: true
+    },
+    auditBearbeiten: {
+        type: OptionType.BOOLEAN,
+        description: "Audit-Log: Bearbeitete Nachrichten protokollieren",
+        default: true
+    },
+    auditRollen: {
+        type: OptionType.BOOLEAN,
+        description: "Audit-Log: Rollenänderungen protokollieren",
+        default: true
     }
 });
 
@@ -200,47 +217,12 @@ async function verstecken(text: string): Promise<string> {
     return (settings.store.tarntext || ".") + bytesToInvisible(payload);
 }
 
-const LINK_RE = /^🔒 \[Geschützte Nachricht[^\]]*\]\(<[^>]*#([A-Za-z0-9_-]{24,})>\)/;
-
-function bytesZuBase64url(bytes: Uint8Array): string {
-    let bin = "";
-    for (const b of bytes) bin += String.fromCharCode(b);
-    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-function base64urlZuBytes(text: string): Uint8Array {
-    const b64 = text.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(text.length / 4) * 4, "=");
-    const bin = atob(b64);
-    return Uint8Array.from(bin, c => c.charCodeAt(0));
-}
-
-async function verschluesseln(text: string): Promise<Uint8Array> {
-    const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await getKey(), enc.encode(text)));
-    const payload = new Uint8Array(iv.length + ct.length);
-    payload.set(iv, 0);
-    payload.set(ct, iv.length);
-    return payload;
-}
-
-/** !op-Modus mit Passwort: Link zur Entschlüsselungsseite, die Nachricht steckt verschlüsselt im Link */
-async function passwortNachricht(text: string): Promise<string> {
-    const basis = (settings.store.entschluesselnLink ?? "").trim();
-    if (!/^https:\/\/[^\s<>()]+$/.test(basis)) {
-        throw new Error("Kein gültiger Entschlüsselungs-Link (Plugin-Einstellungen → Entschlüsselungs-Link).");
-    }
-    const payload = bytesZuBase64url(await verschluesseln(text));
-    return `🔒 [Geschützte Nachricht – Passwort nötig](<${basis}#${payload}>)`;
-}
-
-/** null = keine geschützte Nachricht, "" = vorhanden aber nicht entschlüsselbar */
+/** null = keine versteckte Nachricht, "" = vorhanden aber nicht entschlüsselbar */
 async function aufdecken(content: string): Promise<string | null> {
-    const unsichtbar = PAYLOAD_RE.exec(content ?? "");
-    const link = LINK_RE.exec(content ?? "");
-    if (!unsichtbar && !link) return null;
-
+    const match = PAYLOAD_RE.exec(content ?? "");
+    if (!match) return null;
     try {
-        const bytes = unsichtbar ? invisibleToBytes(unsichtbar[0]) : base64urlZuBytes(link![1]);
+        const bytes = invisibleToBytes(match[0]);
         const iv = bytes.slice(0, 12);
         const ct = bytes.slice(12);
         const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, await getKey(), ct);
@@ -272,7 +254,7 @@ function Aufgedeckt({ message }: { message: { content: string; }; }) {
 
 /* ---------------------------------- Befehle ---------------------------------- */
 
-const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe)\b\s*(.*)$/is;
+const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe|auditlog)\b\s*(.*)$/is;
 const uebersprungen = new Set<string>();
 
 const info = (channelId: string, content: string) => sendBotMessage(channelId, { content });
@@ -413,6 +395,34 @@ async function befehl(cmd: string, arg: string, channelId: string) {
             break;
         }
 
+        case "auditlog": {
+            const unterbefehl = arg.trim().toLowerCase();
+
+            if (unterbefehl === "aus") {
+                settings.store.auditAktiv = false;
+                info(channelId, "📋 Audit-Log ausgeschaltet.");
+                break;
+            }
+
+            if (unterbefehl === "status") {
+                info(channelId, auditBereit()
+                    ? `📋 Audit-Log ist AN. Protokoll-Kanal: <#${settings.store.auditKanalId}>. Im Zwischenspeicher: ${auditCache.size} Nachrichten.`
+                    : "📋 Audit-Log ist AUS. Schreibe !auditlog in deinem Admin-Kanal, um es einzuschalten.");
+                break;
+            }
+
+            if (!guildId) throw new Error("Nur auf Servern möglich. Schreibe den Befehl im Admin-Kanal deines Servers.");
+
+            settings.store.auditServerId = guildId;
+            settings.store.auditKanalId = channelId;
+            settings.store.auditAktiv = true;
+            rollenVorladen();
+
+            info(channelId, "✅ Audit-Log ist AN. Alle Meldungen landen ab jetzt in diesem Kanal. Achte darauf, dass nur Admins ihn sehen können, denn hier steht auch der Inhalt gelöschter Nachrichten.");
+            auditSenden("📋 **Audit-Log gestartet.** Ab jetzt werden gelöschte und bearbeitete Nachrichten sowie Rollenänderungen hier protokolliert.");
+            break;
+        }
+
         case "hilfe": {
             info(channelId, [
                 "📖 **Befehle**",
@@ -425,6 +435,7 @@ async function befehl(cmd: string, arg: string, channelId: string) {
                 "`!purge <Anzahl>` letzte Nachrichten im Kanal löschen",
                 "`!avatar [ID]` Profilbild anzeigen",
                 "`!op` Versteckt-Modus umschalten",
+                "`!auditlog` Protokoll in diesem Kanal einschalten (`!auditlog aus` / `!auditlog status`)",
                 "`!update` / `!version` Plugin aktualisieren / Version zeigen"
             ].join("\n"));
             break;
@@ -445,9 +456,7 @@ async function befehl(cmd: string, arg: string, channelId: string) {
             settings.store.versteckt = !settings.store.versteckt;
             info(channelId, settings.store.versteckt
                 ? "🕶️ Versteckt-Modus AN: Nur Leute mit Plugin + Passwort sehen deine Nachrichten."
-                : settings.store.opModus === "passwort"
-                    ? "🔑 !op aktiv: Deine Nachrichten sind sichtbar, aber nur mit Passwort lesbar (mit Plugin automatisch, ohne Plugin über die Entschlüsselungsseite)."
-                    : "👁️ !op aktiv: Deine Nachrichten sind jetzt für alle normal sichtbar.");
+                : "👁️ !op aktiv: Deine Nachrichten sind jetzt für alle normal sichtbar.");
             break;
         }
     }
@@ -468,33 +477,14 @@ const preSend: MessageSendListener = async (channelId, msg) => {
         return { cancel: true };
     }
 
-    if (!text) return;
+    if (!settings.store.versteckt || !text) return;
 
-    // Versteckt-Modus: Leute ohne Plugin sehen nur den Tarntext
-    if (settings.store.versteckt) {
-        const versteckt = await verstecken(text);
-        if (versteckt.length > 2000) {
-            info(channelId, "❌ Nachricht zu lang für den Versteckt-Modus (max. ca. 450 Zeichen). Kürzen oder !op nutzen.");
-            return { cancel: true };
-        }
-        msg.content = versteckt;
-        return;
+    const versteckt = await verstecken(text);
+    if (versteckt.length > 2000) {
+        info(channelId, "❌ Nachricht zu lang für den Versteckt-Modus (max. ca. 450 Zeichen). Kürzen oder !op nutzen.");
+        return { cancel: true };
     }
-
-    // !op-Modus mit Passwort: Plugin-Nutzer sehen den Text automatisch, alle anderen brauchen das Passwort
-    if (settings.store.opModus === "passwort") {
-        try {
-            const geschuetzt = await passwortNachricht(text);
-            if (geschuetzt.length > 2000) {
-                info(channelId, "❌ Nachricht zu lang für den Passwortschutz. Bitte kürzen oder mit !op in den Modus „Offen“ wechseln (Plugin-Einstellungen).");
-                return { cancel: true };
-            }
-            msg.content = geschuetzt;
-        } catch (e) {
-            info(channelId, `❌ Fehler: ${fehlerText(e)}`);
-            return { cancel: true };
-        }
-    }
+    msg.content = versteckt;
 };
 
 /* ------------------------------ Willkommensnachricht ------------------------------ */
@@ -565,6 +555,288 @@ function aktualisiereHintergrund() {
         }
     `;
     document.head.append(hintergrundStyle);
+}
+
+/* ------------------------------ Erweitertes Audit-Log ------------------------------ */
+
+type AuditNachricht = {
+    id: string;
+    autorId: string;
+    autor: string;
+    inhalt: string;
+    anhaenge: string[];
+    zeit: number;
+};
+
+// Zwischenspeicher: Nur Nachrichten, die dein Discord seit dem Start gesehen hat, sind bekannt
+const auditCache = new Map<string, AuditNachricht>();
+const rollenCache = new Map<string, string[]>();
+const auditWarteschlange: string[] = [];
+let auditVerworfen = 0;
+let auditSender: ReturnType<typeof setTimeout> | null = null;
+let auditVorladeTimer: ReturnType<typeof setTimeout> | null = null;
+
+const pause = (ms: number) => new Promise<void>(r => setTimeout(r, ms));
+
+function auditBereit(): boolean {
+    const { auditAktiv, auditServerId, auditKanalId } = settings.store;
+    return !!(auditAktiv && auditServerId && auditKanalId);
+}
+
+function imAuditServer(guildId: string | undefined, channelId: string | undefined): boolean {
+    const gid = guildId ?? (channelId ? ChannelStore.getChannel(channelId)?.guild_id : undefined);
+    return !!gid && gid === settings.store.auditServerId;
+}
+
+/** Entfernt Backticks und verhindert, dass @everyone oder Erwähnungen jemanden anpingen */
+function entschaerfen(text: string): string {
+    return String(text ?? "").replaceAll("`", "'").replaceAll("@", "@\u200b");
+}
+
+function kuerzen(text: string, max = 700): string {
+    const t = text ?? "";
+    return t.length > max ? t.slice(0, max) + "… (gekürzt)" : t;
+}
+
+/** Packt Text in einen Codeblock (darin pingen Erwähnungen nicht) */
+function codeblock(text: string): string {
+    const sauber = kuerzen(text || "(kein Text)").replaceAll("```", "`\u200b``");
+    return "```\n" + sauber + "\n```";
+}
+
+const zeitMarke = (ms: number) => `<t:${Math.floor(ms / 1000)}:f>`;
+const snowflakeZeit = (id: string) => Number((BigInt(id) >> 22n) + 1420070400000n);
+const nutzerText = (name: string, id: string) => `\`${entschaerfen(name)}\` (\`${id}\`)`;
+
+/** Schickt Meldungen nacheinander (höchstens eine pro Sekunde), damit Discord nicht bremst */
+function auditSenden(text: string) {
+    if (!auditBereit()) return;
+    if (auditWarteschlange.length >= 100) {
+        auditVerworfen++;
+        return;
+    }
+    auditWarteschlange.push(text);
+    if (!auditSender) auditSender = setTimeout(auditLeeren, 300);
+}
+
+async function auditLeeren() {
+    auditSender = null;
+    if (!auditBereit()) {
+        auditWarteschlange.length = 0;
+        return;
+    }
+
+    if (!auditWarteschlange.length && auditVerworfen) {
+        auditWarteschlange.push(`⚠️ ${auditVerworfen} weitere Ereignisse wurden wegen Überlastung nicht protokolliert.`);
+        auditVerworfen = 0;
+    }
+
+    const text = auditWarteschlange.shift();
+    if (text === undefined) return;
+
+    try {
+        const content = text.slice(0, 2000);
+        uebersprungen.add(content); // nicht verschlüsseln
+        await sendMessage(settings.store.auditKanalId, { content });
+    } catch (e) {
+        console.error("[MeinPlugin] Audit-Log konnte nicht gesendet werden:", e);
+    }
+
+    if (auditWarteschlange.length || auditVerworfen) auditSender = setTimeout(auditLeeren, 1100);
+}
+
+function auditMerken(m: any, channelId: string) {
+    if (!m?.id || !m.author) return;
+
+    auditCache.set(m.id, {
+        id: m.id,
+        autorId: m.author.id,
+        autor: m.author.username ?? m.author.id,
+        inhalt: m.content ?? "",
+        anhaenge: (m.attachments ?? []).map((a: any) => a.filename).filter(Boolean),
+        zeit: m.timestamp ? new Date(m.timestamp).getTime() : Date.now()
+    });
+
+    if (auditCache.size > 5000) {
+        const aeltester = auditCache.keys().next().value;
+        if (aeltester) auditCache.delete(aeltester);
+    }
+}
+
+/* --- Nachrichten merken --- */
+
+function auditNachrichtNeu({ message, optimistic, channelId, guildId }: any) {
+    if (!auditBereit() || optimistic || !message) return;
+    const kanal: string | undefined = channelId ?? message.channel_id;
+    if (!kanal || !imAuditServer(guildId, kanal) || kanal === settings.store.auditKanalId) return;
+    auditMerken(message, kanal);
+}
+
+/** Nachrichten, die beim Öffnen eines Kanals geladen werden, ebenfalls merken */
+function auditGeschichte({ channelId, messages }: any) {
+    if (!auditBereit() || !Array.isArray(messages)) return;
+    if (!imAuditServer(undefined, channelId) || channelId === settings.store.auditKanalId) return;
+    for (const m of messages) {
+        if (!auditCache.has(m.id)) auditMerken(m, channelId);
+    }
+}
+
+/* --- Bearbeitet --- */
+
+function auditBearbeitet({ message, guildId }: any) {
+    if (!auditBereit() || !settings.store.auditBearbeiten || !message?.id) return;
+
+    const kanal: string | undefined = message.channel_id;
+    if (!kanal || !imAuditServer(guildId, kanal) || kanal === settings.store.auditKanalId) return;
+    if (typeof message.content !== "string") return; // z. B. nur eine Link-Vorschau wurde ergänzt
+
+    const alt = auditCache.get(message.id);
+    if (alt && alt.inhalt === message.content) return;
+    if (!alt && !message.edited_timestamp) return;
+
+    const autorId: string = message.author?.id ?? alt?.autorId ?? "?";
+    const autor: string = message.author?.username ?? alt?.autor ?? autorId;
+    const gid = guildId ?? ChannelStore.getChannel(kanal)?.guild_id;
+
+    auditSenden([
+        `✏️ **Nachricht bearbeitet** in <#${kanal}>`,
+        `**Autor:** ${nutzerText(autor, autorId)}`,
+        `**Zeit:** ${zeitMarke(Date.now())}`,
+        "**Vorher:**",
+        codeblock(alt ? alt.inhalt : "(unbekannt, die Nachricht wurde vor dem Start von Discord gesendet)"),
+        "**Nachher:**",
+        codeblock(message.content),
+        `<https://discord.com/channels/${gid}/${kanal}/${message.id}>`
+    ].join("\n"));
+
+    if (alt) alt.inhalt = message.content;
+    else auditMerken(message, kanal);
+}
+
+/* --- Gelöscht --- */
+
+function auditGeloescht({ id, channelId, guildId }: any) {
+    if (!auditBereit() || !settings.store.auditLoeschen || !id) return;
+    if (!imAuditServer(guildId, channelId) || channelId === settings.store.auditKanalId) return;
+
+    const alt = auditCache.get(id);
+    auditCache.delete(id);
+
+    const zeilen = [`🗑️ **Nachricht gelöscht** in <#${channelId}>`];
+    if (alt) {
+        zeilen.push(
+            `**Autor:** ${nutzerText(alt.autor, alt.autorId)}`,
+            `**Gesendet:** ${zeitMarke(alt.zeit)}`,
+            "**Inhalt:**",
+            codeblock(alt.inhalt)
+        );
+        if (alt.anhaenge.length) zeilen.push(`**Anhänge:** ${entschaerfen(alt.anhaenge.join(", "))}`);
+    } else {
+        zeilen.push(
+            `**Gesendet:** ${zeitMarke(snowflakeZeit(id))}`,
+            "**Inhalt:** unbekannt (die Nachricht wurde vor dem Start von Discord gesendet oder nie geladen)"
+        );
+    }
+    auditSenden(zeilen.join("\n"));
+}
+
+function auditMassenLoeschung({ ids, channelId, guildId }: any) {
+    if (!auditBereit() || !settings.store.auditLoeschen || !Array.isArray(ids)) return;
+    if (!imAuditServer(guildId, channelId) || channelId === settings.store.auditKanalId) return;
+
+    const zeilen = [`🧹 **${ids.length} Nachrichten auf einmal gelöscht** in <#${channelId}>`];
+    for (const id of ids.slice(0, 15)) {
+        const m = auditCache.get(id);
+        zeilen.push(m
+            ? `• ${entschaerfen(m.autor)}: ${entschaerfen(kuerzen(m.inhalt.replace(/\s+/g, " "), 80))}`
+            : "• (unbekannte Nachricht)");
+    }
+    if (ids.length > 15) zeilen.push(`… und ${ids.length - 15} weitere`);
+
+    for (const id of ids) auditCache.delete(id);
+    auditSenden(zeilen.join("\n"));
+}
+
+/* --- Rollenänderungen --- */
+
+function rollenName(guildId: string, roleId: string): string {
+    const rolle = GuildStore.getRole?.(guildId, roleId) ?? GuildStore.getRoles?.(guildId)?.[roleId];
+    return entschaerfen(rolle?.name ?? roleId);
+}
+
+function rollenVorladen() {
+    const gid = settings.store.auditServerId;
+    if (!auditBereit() || !gid) return;
+    try {
+        for (const m of GuildMemberStore.getMembers(gid) ?? []) {
+            rollenCache.set(`${gid}:${m.userId}`, [...(m.roles ?? [])]);
+        }
+    } catch (e) {
+        console.error("[MeinPlugin] Rollen konnten nicht vorgeladen werden:", e);
+    }
+}
+
+async function auditRolle({ guildId, roles, user }: any) {
+    if (!auditBereit() || guildId !== settings.store.auditServerId) return;
+    if (!user?.id || !Array.isArray(roles)) return;
+
+    const schluessel = `${guildId}:${user.id}`;
+    const alt = rollenCache.get(schluessel);
+    rollenCache.set(schluessel, [...roles]);
+    if (!settings.store.auditRollen || !alt) return;
+
+    const dazu = roles.filter((r: string) => !alt.includes(r));
+    const weg = alt.filter(r => !roles.includes(r));
+    if (!dazu.length && !weg.length) return;
+
+    // Wer hat es geändert? Steht nur im echten Discord-Audit-Log (Recht "Audit-Log ansehen" nötig)
+    let verursacher = "unbekannt";
+    try {
+        await pause(2000);
+        const res = await RestAPI.get({ url: `/guilds/${guildId}/audit-logs`, query: { action_type: 25, limit: 10 } });
+        const eintrag = res.body.audit_log_entries.find(
+            (e: any) => e.target_id === user.id && Date.now() - snowflakeZeit(e.id) < 20_000
+        );
+        if (eintrag) {
+            const u = res.body.users.find((x: any) => x.id === eintrag.user_id);
+            verursacher = nutzerText(u?.username ?? eintrag.user_id, eintrag.user_id);
+        }
+    } catch {
+        // Ohne das Recht bleibt der Verursacher unbekannt
+    }
+
+    const zeilen = [`🛡️ **Rollen geändert** für ${nutzerText(user.username ?? user.id, user.id)}`];
+    if (dazu.length) zeilen.push(`➕ **Hinzugefügt:** ${dazu.map((r: string) => rollenName(guildId, r)).join(", ")}`);
+    if (weg.length) zeilen.push(`➖ **Entfernt:** ${weg.map(r => rollenName(guildId, r)).join(", ")}`);
+    zeilen.push(`👤 **Geändert von:** ${verursacher}`, `🕒 ${zeitMarke(Date.now())}`);
+    auditSenden(zeilen.join("\n"));
+}
+
+/* --- Start und Stopp --- */
+
+function auditStart() {
+    auditStop();
+    FluxDispatcher.subscribe("MESSAGE_CREATE", auditNachrichtNeu);
+    FluxDispatcher.subscribe("MESSAGE_UPDATE", auditBearbeitet);
+    FluxDispatcher.subscribe("MESSAGE_DELETE", auditGeloescht);
+    FluxDispatcher.subscribe("MESSAGE_DELETE_BULK", auditMassenLoeschung);
+    FluxDispatcher.subscribe("LOAD_MESSAGES_SUCCESS", auditGeschichte);
+    FluxDispatcher.subscribe("GUILD_MEMBER_UPDATE", auditRolle);
+    auditVorladeTimer = setTimeout(rollenVorladen, 10_000);
+}
+
+function auditStop() {
+    FluxDispatcher.unsubscribe("MESSAGE_CREATE", auditNachrichtNeu);
+    FluxDispatcher.unsubscribe("MESSAGE_UPDATE", auditBearbeitet);
+    FluxDispatcher.unsubscribe("MESSAGE_DELETE", auditGeloescht);
+    FluxDispatcher.unsubscribe("MESSAGE_DELETE_BULK", auditMassenLoeschung);
+    FluxDispatcher.unsubscribe("LOAD_MESSAGES_SUCCESS", auditGeschichte);
+    FluxDispatcher.unsubscribe("GUILD_MEMBER_UPDATE", auditRolle);
+    if (auditVorladeTimer) clearTimeout(auditVorladeTimer);
+    if (auditSender) clearTimeout(auditSender);
+    auditVorladeTimer = null;
+    auditSender = null;
+    auditWarteschlange.length = 0;
 }
 
 /* ------------------------------------ Torwächter ------------------------------------ */
@@ -761,6 +1033,7 @@ export default definePlugin({
         FluxDispatcher.subscribe("MESSAGE_CREATE", onMessageCreate);
         FluxDispatcher.subscribe("GUILD_CREATE", onGuildCreate);
         torStart();
+        auditStart();
     },
 
     stop() {
@@ -772,5 +1045,6 @@ export default definePlugin({
         FluxDispatcher.unsubscribe("MESSAGE_CREATE", onMessageCreate);
         FluxDispatcher.unsubscribe("GUILD_CREATE", onGuildCreate);
         torStop();
+        auditStop();
     }
 });
