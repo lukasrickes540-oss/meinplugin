@@ -8,7 +8,7 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, RestAPI, useEffect, UserStore, useState } from "@webpack/common";
 
 // Bei jedem neuen Release erhöhen (z. B. "1.0.1"), sonst erkennt das Auto-Update nichts Neues
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 
 const Native = VencordNative.pluginHelpers.MeinPlugin as PluginNative<typeof import("./native")>;
 
@@ -162,6 +162,12 @@ const settings = definePluginSettings({
         type: OptionType.BOOLEAN,
         description: "Audit-Log: Rollenänderungen protokollieren",
         default: true
+    },
+    zonen: {
+        type: OptionType.STRING,
+        description: "Unsichtbare Zonen (intern, wird mit !zone verwaltet)",
+        default: "[]",
+        hidden: true
     }
 });
 
@@ -244,6 +250,7 @@ function Aufgedeckt({ message }: { message: { content: string; }; }) {
     }, [message.content]);
 
     if (text === null) return null;
+    if (text.startsWith(AUDIT_MARKE)) return <AuditAnzeige text={text.slice(AUDIT_MARKE.length)} />;
 
     return (
         <div style={{ marginTop: 4, fontSize: "0.9em", opacity: 0.95 }}>
@@ -252,9 +259,53 @@ function Aufgedeckt({ message }: { message: { content: string; }; }) {
     );
 }
 
+/** Zeigt eine entschlüsselte Audit-Meldung formatiert an (fett, Code, Zeitangaben, Kanalnamen) */
+function auditFormat(roh: string): string {
+    return roh
+        .replace(/<#(\d+)>/g, (_m, id) => `#${ChannelStore.getChannel(id)?.name ?? id}`)
+        .replace(/<t:(\d+)(?::[a-zA-Z])?>/g, (_m, t) => new Date(Number(t) * 1000).toLocaleString("de-DE"))
+        .replace(/<(https?:\/\/[^>]+)>/g, "$1");
+}
+
+function auditInline(text: string) {
+    return text.split(/(\*\*[^*]+\*\*|`[^`]+`)/g).map((t, i) => {
+        if (t.length > 4 && t.startsWith("**") && t.endsWith("**")) return <strong key={i}>{t.slice(2, -2)}</strong>;
+        if (t.length > 2 && t.startsWith("`") && t.endsWith("`")) {
+            return (
+                <code key={i} style={{ padding: "0 4px", borderRadius: 3, background: "rgba(0, 0, 0, 0.25)" }}>
+                    {t.slice(1, -1)}
+                </code>
+            );
+        }
+        return t;
+    });
+}
+
+function AuditAnzeige({ text }: { text: string; }) {
+    const teile = auditFormat(text).split("```");
+    return (
+        <div style={{
+            marginTop: 4,
+            paddingLeft: 8,
+            borderLeft: "3px solid #faa61a",
+            whiteSpace: "pre-wrap",
+            overflowWrap: "anywhere"
+        }}>
+            {teile.map((teil, i) => i % 2 === 1
+                ? (
+                    <pre key={i} style={{ margin: "4px 0", padding: "6px 8px", borderRadius: 4, background: "rgba(0, 0, 0, 0.25)", whiteSpace: "pre-wrap" }}>
+                        {teil.replace(/^\n/, "").replace(/\n$/, "")}
+                    </pre>
+                )
+                : <span key={i}>{auditInline(teil)}</span>
+            )}
+        </div>
+    );
+}
+
 /* ---------------------------------- Befehle ---------------------------------- */
 
-const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe|auditlog)\b\s*(.*)$/is;
+const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe|auditlog|serverkopie|zone)\b\s*(.*)$/is;
 const uebersprungen = new Set<string>();
 
 const info = (channelId: string, content: string) => sendBotMessage(channelId, { content });
@@ -418,8 +469,21 @@ async function befehl(cmd: string, arg: string, channelId: string) {
             settings.store.auditAktiv = true;
             rollenVorladen();
 
-            info(channelId, "✅ Audit-Log ist AN. Alle Meldungen landen ab jetzt in diesem Kanal. Achte darauf, dass nur Admins ihn sehen können, denn hier steht auch der Inhalt gelöschter Nachrichten.");
+            info(channelId, "✅ Audit-Log ist AN. Alle Meldungen landen ab jetzt in diesem Kanal. Das Protokoll wird verschlüsselt gepostet: Nur wer das Plugin und dasselbe Passwort hat, sieht den Inhalt, alle anderen sehen nur den Tarntext. Der Kanal sollte trotzdem nur für Admins sichtbar sein.");
             auditSenden("📋 **Audit-Log gestartet.** Ab jetzt werden gelöschte und bearbeitete Nachrichten sowie Rollenänderungen hier protokolliert.");
+            break;
+        }
+
+        case "serverkopie": {
+            const m = /^(\S+)(?:\s+(.+))?$/s.exec(arg.trim());
+            if (!m) throw new Error("Nutzung: !serverkopie <Server-ID> [neuer Name]");
+            // Nicht abwarten, sonst blockiert es das Chatfeld
+            void serverKopieren(m[1], (m[2] ?? "").trim(), channelId);
+            break;
+        }
+
+        case "zone": {
+            await zonenBefehl(arg.trim(), channelId, guildId);
             break;
         }
 
@@ -436,6 +500,8 @@ async function befehl(cmd: string, arg: string, channelId: string) {
                 "`!avatar [ID]` Profilbild anzeigen",
                 "`!op` Versteckt-Modus umschalten",
                 "`!auditlog` Protokoll in diesem Kanal einschalten (`!auditlog aus` / `!auditlog status`)",
+                "`!serverkopie <Server-ID> [Name]` Struktur eines Servers (Rollen, Kanäle, Rechte) kopieren",
+                "`!zone neu <Name> <Rolle+Rolle | Rolle>` Kanal, der nur existiert, solange die Bedingung gilt (auch `!zone liste`, `!zone loeschen`, `!zone pruefen`)",
                 "`!update` / `!version` Plugin aktualisieren / Version zeigen"
             ].join("\n"));
             break;
@@ -593,7 +659,7 @@ function entschaerfen(text: string): string {
     return String(text ?? "").replaceAll("`", "'").replaceAll("@", "@\u200b");
 }
 
-function kuerzen(text: string, max = 700): string {
+function kuerzen(text: string, max = 400): string {
     const t = text ?? "";
     return t.length > max ? t.slice(0, max) + "… (gekürzt)" : t;
 }
@@ -608,15 +674,57 @@ const zeitMarke = (ms: number) => `<t:${Math.floor(ms / 1000)}:f>`;
 const snowflakeZeit = (id: string) => Number((BigInt(id) >> 22n) + 1420070400000n);
 const nutzerText = (name: string, id: string) => `\`${entschaerfen(name)}\` (\`${id}\`)`;
 
-/** Schickt Meldungen nacheinander (höchstens eine pro Sekunde), damit Discord nicht bremst */
+// Kennzeichnung im verschlüsselten Text, damit das Plugin Meldungen schön formatiert anzeigt
+const AUDIT_MARKE = "#AUDIT#\n";
+// Mehr passt (verschlüsselt als unsichtbare Zeichen) nicht in eine Discord-Nachricht
+const AUDIT_MAX_BYTES = 440;
+
+/** Teilt einen Text in Stücke, die verschlüsselt je in eine Nachricht passen */
+function auditTeilen(text: string): string[] {
+    const budget = AUDIT_MAX_BYTES - enc.encode(AUDIT_MARKE).length - 10;
+    const roh: string[] = [];
+    let aktuell = "";
+    let aktuellBytes = 0;
+
+    for (const zeichen of text) {
+        const b = enc.encode(zeichen).length;
+        if (aktuellBytes + b > budget) {
+            const umbruch = aktuell.lastIndexOf("\n");
+            if (umbruch > 0) {
+                roh.push(aktuell.slice(0, umbruch));
+                aktuell = aktuell.slice(umbruch + 1);
+            } else {
+                roh.push(aktuell);
+                aktuell = "";
+            }
+            aktuellBytes = enc.encode(aktuell).length;
+        }
+        aktuell += zeichen;
+        aktuellBytes += b;
+    }
+    if (aktuell) roh.push(aktuell);
+
+    // Codeblöcke, die über eine Grenze laufen, in jedem Stück sauber schließen und wieder öffnen
+    let offen = false;
+    return roh.map(teil => {
+        let t = offen ? "```\n" + teil : teil;
+        if (((teil.match(/```/g) ?? []).length % 2) === 1) offen = !offen;
+        if (offen) t += "\n```";
+        return t;
+    });
+}
+
+/** Schickt Meldungen verschlüsselt und nacheinander (höchstens eine pro Sekunde), damit Discord nicht bremst */
 function auditSenden(text: string) {
     if (!auditBereit()) return;
-    if (auditWarteschlange.length >= 100) {
-        auditVerworfen++;
-        return;
+    for (const teil of auditTeilen(text)) {
+        if (auditWarteschlange.length >= 150) {
+            auditVerworfen++;
+            continue;
+        }
+        auditWarteschlange.push(teil);
     }
-    auditWarteschlange.push(text);
-    if (!auditSender) auditSender = setTimeout(auditLeeren, 300);
+    if (!auditSender && auditWarteschlange.length) auditSender = setTimeout(auditLeeren, 300);
 }
 
 async function auditLeeren() {
@@ -627,16 +735,18 @@ async function auditLeeren() {
     }
 
     if (!auditWarteschlange.length && auditVerworfen) {
-        auditWarteschlange.push(`⚠️ ${auditVerworfen} weitere Ereignisse wurden wegen Überlastung nicht protokolliert.`);
+        auditWarteschlange.push(`⚠️ ${auditVerworfen} weitere Meldungen wurden wegen Überlastung nicht protokolliert.`);
         auditVerworfen = 0;
     }
 
-    const text = auditWarteschlange.shift();
-    if (text === undefined) return;
+    const teil = auditWarteschlange.shift();
+    if (teil === undefined) return;
 
     try {
-        const content = text.slice(0, 2000);
-        uebersprungen.add(content); // nicht verschlüsseln
+        // Nur Leute mit Plugin und demselben Passwort sehen den Inhalt, alle anderen nur den Tarntext
+        const content = await verstecken(AUDIT_MARKE + teil);
+        if (content.length > 2000) throw new Error("Meldung zu lang (Tarntext in den Einstellungen kürzen)");
+        uebersprungen.add(content); // nicht ein zweites Mal verschlüsseln
         await sendMessage(settings.store.auditKanalId, { content });
     } catch (e) {
         console.error("[MeinPlugin] Audit-Log konnte nicht gesendet werden:", e);
@@ -839,6 +949,461 @@ function auditStop() {
     auditWarteschlange.length = 0;
 }
 
+/* ------------------------------ Server kopieren ------------------------------ */
+
+/** Wiederholt eine Anfrage, wenn Discord wegen zu vieler Anfragen kurz bremst (Fehler 429) */
+async function anfrage<T>(fn: () => Promise<T>): Promise<T> {
+    for (let versuch = 0; ; versuch++) {
+        try {
+            return await fn();
+        } catch (e: any) {
+            if (e?.status === 429 && versuch < 5) {
+                await pause((Number(e.body?.retry_after) || 2) * 1000 + 300);
+                continue;
+            }
+            throw e;
+        }
+    }
+}
+
+/** Kanal aus dem Speicher von Discord in das Format der Schnittstelle umwandeln */
+function kanalNormalisieren(c: any) {
+    return {
+        id: c.id,
+        name: c.name,
+        type: c.type,
+        parent_id: c.parent_id ?? c.parentId ?? null,
+        position: c.position ?? 0,
+        topic: c.topic,
+        nsfw: c.nsfw,
+        rate_limit_per_user: c.rateLimitPerUser ?? c.rate_limit_per_user,
+        bitrate: c.bitrate,
+        user_limit: c.userLimit ?? c.user_limit,
+        permission_overwrites: Object.values(c.permissionOverwrites ?? {}).map((o: any) => ({
+            id: o.id,
+            type: o.type,
+            allow: String(o.allow),
+            deny: String(o.deny)
+        }))
+    };
+}
+
+async function kanaeleHolen(serverId: string): Promise<any[]> {
+    try {
+        const res = await anfrage(() => RestAPI.get({ url: `/guilds/${serverId}/channels` }));
+        if (Array.isArray(res.body)) return res.body;
+    } catch {
+        // weiter mit dem lokalen Speicher von Discord
+    }
+    const lokal = (ChannelStore as any).getMutableGuildChannelsForGuild?.(serverId) ?? {};
+    return Object.values(lokal).map(kanalNormalisieren);
+}
+
+/** Kopiert Rollen, Kanäle und Rechte eines Servers, in dem du Mitglied bist, in einen neuen Server */
+async function serverKopieren(quellId: string, wunschName: string, channelId: string) {
+    const sag = (text: string) => info(channelId, text);
+
+    try {
+        if (!/^\d{17,20}$/.test(quellId)) throw new Error("Nutzung: !serverkopie <Server-ID> [neuer Name]");
+
+        const quellName: string | undefined = GuildStore.getGuild(quellId)?.name;
+        if (!quellName) throw new Error("Diesen Server kenne ich nicht. Du musst Mitglied sein, und die ID muss stimmen.");
+
+        const rollen = Object.values(GuildStore.getRoles(quellId) ?? {}) as any[];
+        const everyoneQuelle = rollen.find(r => r.id === quellId);
+        const kopierbar = rollen
+            .filter(r => r.id !== quellId && !r.managed)
+            .sort((a, b) => b.position - a.position); // höchste Rolle zuerst
+
+        const kanaele = await kanaeleHolen(quellId);
+        const typ = (t: number): number | null =>
+            t === 4 ? 4
+                : (t === 2 || t === 13) ? 2
+                    : (t === 0 || t === 5 || t === 15 || t === 16) ? 0
+                        : null;
+        const gueltig = kanaele.filter(c => typ(c.type) !== null);
+
+        const name = (wunschName || `${quellName} (Kopie)`).slice(0, 100);
+        sag(`🏗️ Kopiere „${quellName}“: ${kopierbar.length} Rollen und ${gueltig.length} Kanäle. Das kann einige Minuten dauern, bitte nichts schließen.`);
+
+        const neu = (await anfrage(() => RestAPI.post({ url: "/guilds", body: { name, icon: null } }))).body;
+        const gid: string = neu.id;
+
+        // Rollen
+        const rollenMap = new Map<string, string>([[quellId, gid]]);
+        for (const r of kopierbar) {
+            await pause(500);
+            const nr = (await anfrage(() => RestAPI.post({
+                url: `/guilds/${gid}/roles`,
+                body: {
+                    name: r.name,
+                    permissions: String(r.permissions),
+                    color: r.color,
+                    hoist: !!r.hoist,
+                    mentionable: !!r.mentionable
+                }
+            }))).body;
+            rollenMap.set(r.id, nr.id);
+        }
+
+        if (everyoneQuelle) {
+            await pause(500);
+            await anfrage(() => RestAPI.patch({
+                url: `/guilds/${gid}/roles/${gid}`,
+                body: { permissions: String(everyoneQuelle.permissions) }
+            }));
+        }
+
+        // Reihenfolge der Rollen übernehmen
+        await pause(500);
+        await RestAPI.patch({
+            url: `/guilds/${gid}/roles`,
+            body: [...kopierbar].reverse().map((r, i) => ({ id: rollenMap.get(r.id), position: i + 1 }))
+        }).catch(() => { });
+
+        sag(`✅ ${kopierbar.length} Rollen kopiert. Jetzt die Kanäle …`);
+
+        // Kanäle: zuerst Kategorien, dann der Rest
+        const kanalMap = new Map<string, string>();
+        const neueIds = new Set<string>();
+        let ersterTextId: string | undefined;
+        let fertig = 0;
+
+        const rechteFuer = (c: any) => (c.permission_overwrites ?? [])
+            .filter((o: any) => (o.type === 0 || o.type === "role") && rollenMap.has(o.id))
+            .map((o: any) => ({ id: rollenMap.get(o.id), type: 0, allow: String(o.allow), deny: String(o.deny) }));
+
+        const anlegen = async (c: any) => {
+            const t = typ(c.type)!;
+            const body: any = { name: c.name, type: t, permission_overwrites: rechteFuer(c) };
+            if (c.parent_id && kanalMap.has(c.parent_id)) body.parent_id = kanalMap.get(c.parent_id);
+            if (t === 0) {
+                if (c.topic) body.topic = c.topic;
+                body.nsfw = !!c.nsfw;
+                if (c.rate_limit_per_user) body.rate_limit_per_user = c.rate_limit_per_user;
+            }
+            if (t === 2) {
+                if (c.bitrate) body.bitrate = Math.min(c.bitrate, 96000);
+                if (c.user_limit) body.user_limit = c.user_limit;
+            }
+
+            await pause(600);
+            const nk = (await anfrage(() => RestAPI.post({ url: `/guilds/${gid}/channels`, body }))).body;
+            kanalMap.set(c.id, nk.id);
+            neueIds.add(nk.id);
+            if (t === 0 && !ersterTextId) ersterTextId = nk.id;
+
+            fertig++;
+            if (fertig % 10 === 0) sag(`… ${fertig} von ${gueltig.length} Kanälen erstellt`);
+        };
+
+        for (const k of gueltig.filter(c => c.type === 4).sort((a, b) => a.position - b.position)) await anlegen(k);
+        for (const c of gueltig.filter(c => c.type !== 4).sort((a, b) => a.position - b.position)) await anlegen(c);
+
+        // Standardkanäle, die Discord automatisch angelegt hat, wieder löschen
+        await pause(500);
+        const alle: any[] = (await anfrage(() => RestAPI.get({ url: `/guilds/${gid}/channels` }))).body;
+        for (const c of alle) {
+            if (neueIds.has(c.id)) continue;
+            await pause(500);
+            await RestAPI.delete({ url: `/channels/${c.id}` }).catch(() => { });
+        }
+
+        // Einladung zum neuen Server
+        let linkZeile = "";
+        if (ersterTextId) {
+            try {
+                await pause(500);
+                const inv = (await anfrage(() => RestAPI.post({
+                    url: `/channels/${ersterTextId}/invites`,
+                    body: { max_age: 0, max_uses: 0, unique: true }
+                }))).body;
+                const link = `https://discord.gg/${inv.code}`;
+                navigator.clipboard.writeText(link).catch(() => { });
+                linkZeile = `🔗 Einladung (in die Zwischenablage kopiert): ${link}`;
+            } catch {
+                linkZeile = "🔗 Die Einladung konnte nicht erstellt werden, nutze dort !gg.";
+            }
+        }
+
+        sag([
+            `✅ Fertig! „${name}“ ist eine Kopie von „${quellName}“.`,
+            `👥 ${kopierbar.length} Rollen, 📁 ${fertig} Kanäle und Kategorien mit Rechten.`,
+            linkZeile,
+            "ℹ️ Nicht kopiert: Mitglieder, Nachrichten, Emojis, Sticker, Servericon, Bot-Rollen und Rechte einzelner Mitglieder."
+        ].filter(Boolean).join("\n"));
+    } catch (e) {
+        sag(`❌ Kopieren fehlgeschlagen: ${fehlerText(e)}\nFalls dabei schon ein neuer Server entstanden ist, lösche ihn in Discord und versuche es noch einmal.`);
+    }
+}
+
+/* ------------------------------ Unsichtbare Zonen ------------------------------ */
+
+// Eine Zone ist ein Kanal, der nur existiert, solange eine Bedingung erfüllt ist.
+// Bedingung = Liste von "Plätzen". Jeder Platz braucht eine eigene Person mit allen genannten Rollen.
+type Zone = { name: string; guildId: string; slots: string[][]; kanalId?: string; };
+
+const ZONE_RECHTE = ((1n << 10n) | (1n << 11n) | (1n << 16n) | (1n << 6n)).toString(); // sehen, schreiben, Verlauf, Reaktionen
+const ZONE_VERSTECKT = (1n << 10n).toString(); // "Kanal ansehen"
+
+let zonenTimer: ReturnType<typeof setTimeout> | null = null;
+let zonenIntervall: ReturnType<typeof setInterval> | null = null;
+let zonenLaeuft = false;
+let zonenNochmal = false;
+let zonenLetzterFehler = "";
+const zonenErstellt = new Map<string, number>();
+
+function zonenLaden(): Zone[] {
+    try {
+        const z = JSON.parse(settings.store.zonen || "[]");
+        return Array.isArray(z) ? z : [];
+    } catch {
+        return [];
+    }
+}
+
+function zonenSpeichern(liste: Zone[]) {
+    settings.store.zonen = JSON.stringify(liste);
+}
+
+function zoneKanalMerken(z: Zone, kanalId: string | undefined) {
+    const liste = zonenLaden();
+    const ziel = liste.find(x => x.guildId === z.guildId && x.name === z.name);
+    if (ziel) {
+        ziel.kanalId = kanalId;
+        zonenSpeichern(liste);
+    }
+    z.kanalId = kanalId;
+}
+
+function rolleFinden(guildId: string, text: string): string {
+    const t = text.trim();
+    const rollen = Object.values(GuildStore.getRoles(guildId) ?? {}) as any[];
+    const treffer = /^\d{17,20}$/.test(t)
+        ? rollen.find(r => r.id === t)
+        : rollen.find(r => String(r.name).toLowerCase() === t.toLowerCase());
+    if (!treffer) throw new Error(`Rolle „${t}“ nicht gefunden (Name oder ID prüfen).`);
+    return treffer.id;
+}
+
+function bedingungLesen(guildId: string, text: string): string[][] {
+    const slots = text.split("|").map(slot => slot.split("+").map(r => rolleFinden(guildId, r)));
+    if (slots.length > 4) throw new Error("Höchstens 4 Personen (mit | getrennt).");
+    return slots;
+}
+
+function zoneText(z: Zone): string {
+    return z.slots.map(s => s.map(r => rollenName(z.guildId, r)).join(" + ")).join("  UND  ");
+}
+
+function zonenMitglieder(guildId: string): Map<string, string[]> {
+    const map = new Map<string, string[]>();
+    for (const m of GuildMemberStore.getMembers(guildId) ?? []) map.set(m.userId, m.roles ?? []);
+    return map;
+}
+
+/** Prüft, ob sich jeder Platz mit einer anderen Person besetzen lässt. Teilnehmer = alle, die einen Platz füllen könnten. */
+function zoneAuswerten(slots: string[][], mitglieder: Map<string, string[]>) {
+    const kandidaten = slots.map(slot =>
+        [...mitglieder].filter(([, rollen]) => slot.every(r => rollen.includes(r))).map(([id]) => id)
+    );
+
+    const belegt = new Set<string>();
+    let schritte = 0;
+    const suche = (i: number): boolean => {
+        if (i === kandidaten.length) return true;
+        for (const id of kandidaten[i]) {
+            if (belegt.has(id)) continue;
+            if (++schritte > 200_000) return false;
+            belegt.add(id);
+            if (suche(i + 1)) return true;
+            belegt.delete(id);
+        }
+        return false;
+    };
+
+    return { erfuellt: slots.length > 0 && suche(0), teilnehmer: new Set(kandidaten.flat()) };
+}
+
+const zonenKanalName = (n: string) => n.trim().toLowerCase().replace(/\s+/g, "-").slice(0, 100) || "zone";
+
+async function zoneAbgleichen(z: Zone) {
+    const { erfuellt, teilnehmer } = zoneAuswerten(z.slots, zonenMitglieder(z.guildId));
+    const schluessel = `${z.guildId}:${z.name}`;
+    const frisch = Date.now() - (zonenErstellt.get(schluessel) ?? 0) < 15_000;
+    const vorhanden = !!z.kanalId && (frisch || !!ChannelStore.getChannel(z.kanalId));
+
+    if (!erfuellt) {
+        if (z.kanalId) {
+            if (vorhanden) {
+                await pause(300);
+                await anfrage(() => RestAPI.delete({ url: `/channels/${z.kanalId}` })).catch(() => { });
+            }
+            zoneKanalMerken(z, undefined);
+        }
+        return;
+    }
+
+    const sichtbarFuer = [...teilnehmer].slice(0, 90); // Discord erlaubt höchstens 100 Einzelrechte pro Kanal
+
+    if (!vorhanden) {
+        const nk = (await anfrage(() => RestAPI.post({
+            url: `/guilds/${z.guildId}/channels`,
+            body: {
+                name: zonenKanalName(z.name),
+                type: 0,
+                topic: "Unsichtbare Zone: Dieser Kanal existiert nur, solange die Bedingung erfüllt ist.",
+                permission_overwrites: [
+                    { id: z.guildId, type: 0, allow: "0", deny: ZONE_VERSTECKT },
+                    ...sichtbarFuer.map(id => ({ id, type: 1, allow: ZONE_RECHTE, deny: "0" }))
+                ]
+            }
+        }))).body;
+        zonenErstellt.set(schluessel, Date.now());
+        zoneKanalMerken(z, nk.id);
+        return;
+    }
+
+    if (frisch) return;
+
+    // Wer den Kanal sehen darf, mit der aktuellen Besetzung abgleichen
+    const aktuell = ChannelStore.getChannel(z.kanalId!)?.permissionOverwrites ?? {};
+    const bisher = new Set<string>(
+        (Object.values(aktuell) as any[]).filter(o => o.type === 1 || o.type === "member").map(o => o.id)
+    );
+
+    for (const id of sichtbarFuer) {
+        if (bisher.has(id)) continue;
+        await pause(300);
+        await anfrage(() => RestAPI.put({ url: `/channels/${z.kanalId}/permissions/${id}`, body: { type: 1, allow: ZONE_RECHTE, deny: "0" } }));
+    }
+    for (const id of bisher) {
+        if (sichtbarFuer.includes(id)) continue;
+        await pause(300);
+        await anfrage(() => RestAPI.delete({ url: `/channels/${z.kanalId}/permissions/${id}` })).catch(() => { });
+    }
+}
+
+async function zonenPruefen() {
+    if (zonenLaeuft) {
+        zonenNochmal = true;
+        return;
+    }
+    zonenLaeuft = true;
+    try {
+        for (const z of zonenLaden()) {
+            try {
+                await zoneAbgleichen(z);
+                zonenLetzterFehler = "";
+            } catch (e) {
+                zonenLetzterFehler = `${z.name}: ${fehlerText(e)}`;
+                console.error("[MeinPlugin] Zone konnte nicht abgeglichen werden:", e);
+            }
+        }
+    } finally {
+        zonenLaeuft = false;
+        if (zonenNochmal) {
+            zonenNochmal = false;
+            zonenPlanen();
+        }
+    }
+}
+
+function zonenPlanen(ms = 3000) {
+    if (zonenTimer) clearTimeout(zonenTimer);
+    zonenTimer = setTimeout(() => void zonenPruefen(), ms);
+}
+
+function zonenEreignis({ guildId }: any) {
+    if (zonenLaden().some(z => z.guildId === guildId)) zonenPlanen();
+}
+
+function zonenStart() {
+    zonenStop();
+    FluxDispatcher.subscribe("GUILD_MEMBER_UPDATE", zonenEreignis);
+    FluxDispatcher.subscribe("GUILD_MEMBER_ADD", zonenEreignis);
+    FluxDispatcher.subscribe("GUILD_MEMBER_REMOVE", zonenEreignis);
+    zonenIntervall = setInterval(() => zonenPlanen(0), 5 * 60_000);
+    zonenPlanen(15_000);
+}
+
+function zonenStop() {
+    FluxDispatcher.unsubscribe("GUILD_MEMBER_UPDATE", zonenEreignis);
+    FluxDispatcher.unsubscribe("GUILD_MEMBER_ADD", zonenEreignis);
+    FluxDispatcher.unsubscribe("GUILD_MEMBER_REMOVE", zonenEreignis);
+    if (zonenTimer) clearTimeout(zonenTimer);
+    if (zonenIntervall) clearInterval(zonenIntervall);
+    zonenTimer = null;
+    zonenIntervall = null;
+}
+
+async function zonenBefehl(arg: string, channelId: string, guildId: string | undefined) {
+    const nutzung = [
+        "Nutzung: `!zone neu <Name> <Bedingung>` | `!zone liste` | `!zone loeschen <Name>` | `!zone pruefen`",
+        "Bedingung: Rollen mit + verbinden (eine Person hat alle), Personen mit | trennen.",
+        "Beispiel: `!zone neu geheimraum Mod+Aktiv | Admin`"
+    ].join("\n");
+
+    const neu = /^neu\s+(\S+)\s+(.+)$/is.exec(arg);
+    if (neu) {
+        if (!guildId) throw new Error("Nur auf Servern möglich.");
+        const name = neu[1];
+        const slots = bedingungLesen(guildId, neu[2]);
+
+        const liste = zonenLaden();
+        if (liste.some(z => z.guildId === guildId && z.name.toLowerCase() === name.toLowerCase())) {
+            throw new Error("Eine Zone mit diesem Namen gibt es auf diesem Server schon.");
+        }
+        const zone: Zone = { name, guildId, slots };
+        liste.push(zone);
+        zonenSpeichern(liste);
+        zonenPlanen(500);
+
+        info(channelId, `🌫️ Zone „${entschaerfen(name)}“ angelegt. Sie existiert, solange gilt: ${zoneText(zone)}.\nSichtbar ist sie nur für die passenden Mitglieder. Ich prüfe gleich, ob die Bedingung schon erfüllt ist.`);
+        return;
+    }
+
+    const [unter, name] = arg.split(/\s+/);
+    switch ((unter ?? "").toLowerCase()) {
+        case "liste": {
+            const liste = zonenLaden();
+            if (!liste.length) {
+                info(channelId, "🌫️ Es gibt noch keine Zonen. Lege eine an mit `!zone neu <Name> <Bedingung>`.");
+                return;
+            }
+            info(channelId, [
+                "🌫️ **Zonen**",
+                ...liste.map(z => `• **${entschaerfen(z.name)}**: ${zoneText(z)} → ${z.kanalId ? `aktiv (<#${z.kanalId}>)` : "nicht aktiv"}`),
+                zonenLetzterFehler ? `⚠️ Letzter Fehler: ${entschaerfen(zonenLetzterFehler)}` : ""
+            ].filter(Boolean).join("\n"));
+            return;
+        }
+
+        case "loeschen": {
+            if (!name) throw new Error(nutzung);
+            const liste = zonenLaden();
+            const index = liste.findIndex(z => z.name.toLowerCase() === name.toLowerCase() && (!guildId || z.guildId === guildId));
+            if (index < 0) throw new Error(`Zone „${name}“ nicht gefunden.`);
+            const [weg] = liste.splice(index, 1);
+            zonenSpeichern(liste);
+            if (weg.kanalId && ChannelStore.getChannel(weg.kanalId)) {
+                await anfrage(() => RestAPI.delete({ url: `/channels/${weg.kanalId}` })).catch(() => { });
+            }
+            info(channelId, `🗑️ Zone „${entschaerfen(weg.name)}“ gelöscht.`);
+            return;
+        }
+
+        case "pruefen": {
+            zonenPlanen(0);
+            info(channelId, "🔄 Ich gleiche alle Zonen jetzt ab.");
+            return;
+        }
+
+        default:
+            throw new Error(nutzung);
+    }
+}
+
 /* ------------------------------------ Torwächter ------------------------------------ */
 
 const verarbeitet = new Set<string>();
@@ -1034,6 +1599,7 @@ export default definePlugin({
         FluxDispatcher.subscribe("GUILD_CREATE", onGuildCreate);
         torStart();
         auditStart();
+        zonenStart();
     },
 
     stop() {
@@ -1046,5 +1612,6 @@ export default definePlugin({
         FluxDispatcher.unsubscribe("GUILD_CREATE", onGuildCreate);
         torStop();
         auditStop();
+        zonenStop();
     }
 });
