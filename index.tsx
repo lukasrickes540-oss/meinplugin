@@ -8,7 +8,7 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, RestAPI, useEffect, UserStore, useState } from "@webpack/common";
 
 // Bei jedem neuen Release erhöhen (z. B. "1.0.1"), sonst erkennt das Auto-Update nichts Neues
-const VERSION = "1.0.7";
+const VERSION = "1.0.8";
 
 const Native = VencordNative.pluginHelpers.MeinPlugin as PluginNative<typeof import("./native")>;
 
@@ -37,13 +37,26 @@ const settings = definePluginSettings({
     },
     passwort: {
         type: OptionType.STRING,
-        description: "Gemeinsames Passwort. Nur wer dasselbe Passwort + das Plugin hat, kann mitlesen.",
+        description: "Gemeinsames Passwort. Wer es kennt, kann deine geschützten Nachrichten lesen (mit Plugin automatisch, ohne Plugin über die Entschlüsselungsseite).",
         default: "bitte-aendern"
     },
     tarntext: {
         type: OptionType.STRING,
         description: "Text, den Leute OHNE Plugin stattdessen sehen",
         default: "."
+    },
+    opModus: {
+        type: OptionType.SELECT,
+        description: "Was passiert nach !op (Versteckt-Modus aus)?",
+        options: [
+            { label: "Mit Passwort: sichtbar, aber ohne Plugin nur mit Passwort lesbar", value: "passwort", default: true },
+            { label: "Offen: für alle ganz normal lesbar", value: "offen" }
+        ]
+    },
+    entschluesselnLink: {
+        type: OptionType.STRING,
+        description: "Link zur Entschlüsselungsseite (entschluesseln.html) für Leute ohne Plugin",
+        default: "https://lukasrickes540-oss.github.io/meinplugin/entschluesseln.html"
     },
     einladungStunden: {
         type: OptionType.NUMBER,
@@ -187,12 +200,47 @@ async function verstecken(text: string): Promise<string> {
     return (settings.store.tarntext || ".") + bytesToInvisible(payload);
 }
 
-/** null = keine versteckte Nachricht, "" = vorhanden aber nicht entschlüsselbar */
+const LINK_RE = /^🔒 \[Geschützte Nachricht[^\]]*\]\(<[^>]*#([A-Za-z0-9_-]{24,})>\)/;
+
+function bytesZuBase64url(bytes: Uint8Array): string {
+    let bin = "";
+    for (const b of bytes) bin += String.fromCharCode(b);
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64urlZuBytes(text: string): Uint8Array {
+    const b64 = text.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(text.length / 4) * 4, "=");
+    const bin = atob(b64);
+    return Uint8Array.from(bin, c => c.charCodeAt(0));
+}
+
+async function verschluesseln(text: string): Promise<Uint8Array> {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv }, await getKey(), enc.encode(text)));
+    const payload = new Uint8Array(iv.length + ct.length);
+    payload.set(iv, 0);
+    payload.set(ct, iv.length);
+    return payload;
+}
+
+/** !op-Modus mit Passwort: Link zur Entschlüsselungsseite, die Nachricht steckt verschlüsselt im Link */
+async function passwortNachricht(text: string): Promise<string> {
+    const basis = (settings.store.entschluesselnLink ?? "").trim();
+    if (!/^https:\/\/[^\s<>()]+$/.test(basis)) {
+        throw new Error("Kein gültiger Entschlüsselungs-Link (Plugin-Einstellungen → Entschlüsselungs-Link).");
+    }
+    const payload = bytesZuBase64url(await verschluesseln(text));
+    return `🔒 [Geschützte Nachricht – Passwort nötig](<${basis}#${payload}>)`;
+}
+
+/** null = keine geschützte Nachricht, "" = vorhanden aber nicht entschlüsselbar */
 async function aufdecken(content: string): Promise<string | null> {
-    const match = PAYLOAD_RE.exec(content ?? "");
-    if (!match) return null;
+    const unsichtbar = PAYLOAD_RE.exec(content ?? "");
+    const link = LINK_RE.exec(content ?? "");
+    if (!unsichtbar && !link) return null;
+
     try {
-        const bytes = invisibleToBytes(match[0]);
+        const bytes = unsichtbar ? invisibleToBytes(unsichtbar[0]) : base64urlZuBytes(link![1]);
         const iv = bytes.slice(0, 12);
         const ct = bytes.slice(12);
         const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, await getKey(), ct);
@@ -397,7 +445,9 @@ async function befehl(cmd: string, arg: string, channelId: string) {
             settings.store.versteckt = !settings.store.versteckt;
             info(channelId, settings.store.versteckt
                 ? "🕶️ Versteckt-Modus AN: Nur Leute mit Plugin + Passwort sehen deine Nachrichten."
-                : "👁️ !op aktiv: Deine Nachrichten sind jetzt für alle normal sichtbar.");
+                : settings.store.opModus === "passwort"
+                    ? "🔑 !op aktiv: Deine Nachrichten sind sichtbar, aber nur mit Passwort lesbar (mit Plugin automatisch, ohne Plugin über die Entschlüsselungsseite)."
+                    : "👁️ !op aktiv: Deine Nachrichten sind jetzt für alle normal sichtbar.");
             break;
         }
     }
@@ -418,14 +468,33 @@ const preSend: MessageSendListener = async (channelId, msg) => {
         return { cancel: true };
     }
 
-    if (!settings.store.versteckt || !text) return;
+    if (!text) return;
 
-    const versteckt = await verstecken(text);
-    if (versteckt.length > 2000) {
-        info(channelId, "❌ Nachricht zu lang für den Versteckt-Modus (max. ca. 450 Zeichen). Kürzen oder !op nutzen.");
-        return { cancel: true };
+    // Versteckt-Modus: Leute ohne Plugin sehen nur den Tarntext
+    if (settings.store.versteckt) {
+        const versteckt = await verstecken(text);
+        if (versteckt.length > 2000) {
+            info(channelId, "❌ Nachricht zu lang für den Versteckt-Modus (max. ca. 450 Zeichen). Kürzen oder !op nutzen.");
+            return { cancel: true };
+        }
+        msg.content = versteckt;
+        return;
     }
-    msg.content = versteckt;
+
+    // !op-Modus mit Passwort: Plugin-Nutzer sehen den Text automatisch, alle anderen brauchen das Passwort
+    if (settings.store.opModus === "passwort") {
+        try {
+            const geschuetzt = await passwortNachricht(text);
+            if (geschuetzt.length > 2000) {
+                info(channelId, "❌ Nachricht zu lang für den Passwortschutz. Bitte kürzen oder mit !op in den Modus „Offen“ wechseln (Plugin-Einstellungen).");
+                return { cancel: true };
+            }
+            msg.content = geschuetzt;
+        } catch (e) {
+            info(channelId, `❌ Fehler: ${fehlerText(e)}`);
+            return { cancel: true };
+        }
+    }
 };
 
 /* ------------------------------ Willkommensnachricht ------------------------------ */
