@@ -9,7 +9,7 @@ import definePlugin, { OptionType, PluginNative } from "@utils/types";
 import { ChannelStore, FluxDispatcher, GuildMemberStore, GuildStore, RestAPI, useEffect, UserStore, useState } from "@webpack/common";
 
 // Bei jedem neuen Release erhöhen (z. B. "1.0.1"), sonst erkennt das Auto-Update nichts Neues
-const VERSION = "1.2.2";
+const VERSION = "1.4.0";
 
 const Native = VencordNative.pluginHelpers.MeinPlugin as PluginNative<typeof import("./native")>;
 
@@ -169,6 +169,65 @@ const settings = definePluginSettings({
         description: "Unsichtbare Zonen (intern, wird mit !zone verwaltet)",
         default: "[]",
         hidden: true
+    },
+    sprachAktiv: {
+        type: OptionType.BOOLEAN,
+        description: "Eigene Sprachkanäle: Wer die Lobby betritt, bekommt einen eigenen Raum (einrichten mit !sprachlobby)",
+        default: false
+    },
+    sprachServerId: {
+        type: OptionType.STRING,
+        description: "Eigene Sprachkanäle: Server-ID (wird von !sprachlobby gesetzt)",
+        default: ""
+    },
+    sprachLobbyId: {
+        type: OptionType.STRING,
+        description: "Eigene Sprachkanäle: ID des Lobby-Kanals „➕ Erstellen“ (wird von !sprachlobby gesetzt)",
+        default: ""
+    },
+    sprachRaeume: {
+        type: OptionType.STRING,
+        description: "Eigene Räume (intern)",
+        default: "[]",
+        hidden: true
+    },
+    archivAktiv: {
+        type: OptionType.BOOLEAN,
+        description: "Inaktive Kanäle automatisch ins Archiv verschieben (einrichten mit !archiv an)",
+        default: false
+    },
+    archivServerId: {
+        type: OptionType.STRING,
+        description: "Archiv: Server-ID (wird von !archiv an gesetzt)",
+        default: ""
+    },
+    archivTage: {
+        type: OptionType.NUMBER,
+        description: "Archiv: Nach wie vielen Tagen ohne Nachricht ein Kanal archiviert wird",
+        default: 14
+    },
+    archivKategorieId: {
+        type: OptionType.STRING,
+        description: "Archiv: ID der Kategorie „Archiv“ (wird automatisch angelegt)",
+        default: ""
+    },
+    archivListe: {
+        type: OptionType.STRING,
+        description: "Archivierte Kanäle (intern)",
+        default: "[]",
+        hidden: true
+    },
+    archivAusnahmen: {
+        type: OptionType.STRING,
+        description: "Kanäle, die nie archiviert werden (intern, mit !archiv ausnahme)",
+        default: "[]",
+        hidden: true
+    },
+    pluginKanaele: {
+        type: OptionType.STRING,
+        description: "Kanäle nur für Plugin-Nutzer (intern, mit !pluginkanal)",
+        default: "[]",
+        hidden: true
     }
 });
 
@@ -306,7 +365,7 @@ function AuditAnzeige({ text }: { text: string; }) {
 
 /* ---------------------------------- Befehle ---------------------------------- */
 
-const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe|auditlog|serverkopie|zone)\b\s*(.*)$/is;
+const CMD_RE = /^!(gg|op|softban|update|version|kick|ban|unban|mute|unmute|purge|avatar|invites|hilfe|auditlog|serverkopie|zone|sprachlobby|archiv|pluginkanal)\b\s*(.*)$/is;
 const uebersprungen = new Set<string>();
 
 const info = (channelId: string, content: string) => sendBotMessage(channelId, { content });
@@ -488,6 +547,21 @@ async function befehl(cmd: string, arg: string, channelId: string) {
             break;
         }
 
+        case "pluginkanal": {
+            await pluginKanalBefehl(arg.trim(), channelId, guildId);
+            break;
+        }
+
+        case "sprachlobby": {
+            await sprachBefehl(arg.trim(), channelId, guildId);
+            break;
+        }
+
+        case "archiv": {
+            await archivBefehl(arg.trim(), channelId, guildId);
+            break;
+        }
+
         case "hilfe": {
             info(channelId, [
                 "📖 **Befehle**",
@@ -503,6 +577,9 @@ async function befehl(cmd: string, arg: string, channelId: string) {
                 "`!auditlog` Protokoll in diesem Kanal einschalten (`!auditlog aus` / `!auditlog status`)",
                 "`!serverkopie <Server-ID> [Name]` Struktur eines Servers (Rollen, Kanäle, Rechte) kopieren",
                 "`!zone neu <Name>` Unsichtbare Zone komplett automatisch einrichten, `!zone mit <Name> @A @B` verteilt die Rollen (mehr mit `!zone`)",
+                "`!sprachlobby` Lobby „➕ Erstellen“ anlegen: Wer sie betritt, bekommt einen eigenen Sprachraum (`!sprachlobby aus` / `status`)",
+                "`!archiv an [Tage]` Inaktive Kanäle ins Archiv schieben, bei neuer Nachricht kommen sie zurück (mehr mit `!archiv`)",
+                "`!pluginkanal` Diesen Kanal nur für Leute mit dem Plugin zugänglich machen (`!pluginkanal aus` / `liste`)",
                 "`!update` / `!version` Plugin aktualisieren / Version zeigen"
             ].join("\n"));
             break;
@@ -1516,10 +1593,508 @@ async function zonenBefehl(arg: string, channelId: string, guildId: string | und
     }
 }
 
+/* ------------------------------ Gemeinsame Hilfen für Kanäle ------------------------------ */
+
+const GuildChannelStore = findStoreLazy("GuildChannelStore");
+const VoiceStateStore = findStoreLazy("VoiceStateStore");
+
+function jsonListe<T>(text: string | undefined): T[] {
+    try {
+        const l = JSON.parse(text || "[]");
+        return Array.isArray(l) ? l : [];
+    } catch {
+        return [];
+    }
+}
+
+/** Alle dem Client bekannten Kanäle eines Servers (ohne Kategorien-Garantie) */
+function kanaeleVon(guildId: string): any[] {
+    try {
+        const m = (ChannelStore as any).getMutableGuildChannelsForGuild?.(guildId);
+        if (m) return Object.values(m);
+    } catch {
+        // weiter mit dem Ersatzweg
+    }
+    try {
+        const g = GuildChannelStore.getChannels?.(guildId);
+        if (g) return [...(g.SELECTABLE ?? []), ...(g.VOCAL ?? [])].map((x: any) => x.channel ?? x);
+    } catch {
+        // keine Kanäle bekannt
+    }
+    return [];
+}
+
+function anzeigeName(guildId: string, userId: string): string {
+    const m: any = GuildMemberStore.getMember(guildId, userId);
+    const u: any = UserStore.getUser(userId);
+    return m?.nick ?? u?.globalName ?? u?.username ?? userId;
+}
+
+/** Rechte-Überschreibungen eines Kanals im Format der Schnittstelle */
+function rechteVon(kanal: any): { id: string; type: number; allow: string; deny: string; }[] {
+    return (Object.values(kanal?.permissionOverwrites ?? {}) as any[]).map(o => ({
+        id: o.id,
+        type: o.type === "member" ? 1 : o.type === "role" ? 0 : Number(o.type),
+        allow: String(o.allow),
+        deny: String(o.deny)
+    }));
+}
+
+/* ------------------------------ Eigene Sprachkanäle ------------------------------ */
+
+// Wer den Lobby-Kanal "➕ Erstellen" betritt, bekommt einen eigenen Sprachkanal und wird hineinverschoben.
+// Der Besitzer darf seinen Raum selbst umbenennen. Leere Räume werden gelöscht.
+type SprachRaum = { kanalId: string; besitzerId: string; guildId: string; erstellt: number; };
+
+// Kanäle verwalten, Kanal ansehen, Verbinden, Sprechen
+const RAUM_RECHTE = ((1n << 4n) | (1n << 10n) | (1n << 20n) | (1n << 21n)).toString();
+
+const sprachLaeuft = new Set<string>();
+const sprachPausen = new Map<string, number>();
+const sprachTimer = new Map<string, ReturnType<typeof setTimeout>>();
+let sprachIntervall: ReturnType<typeof setInterval> | null = null;
+let sprachStartTimer: ReturnType<typeof setTimeout> | null = null;
+let sprachLetzterFehler = "";
+
+const sprachRaeumeLaden = () => jsonListe<SprachRaum>(settings.store.sprachRaeume);
+const sprachRaeumeSpeichern = (l: SprachRaum[]) => { settings.store.sprachRaeume = JSON.stringify(l); };
+
+function sprachBereit(): boolean {
+    return !!(settings.store.sprachAktiv && settings.store.sprachServerId && settings.store.sprachLobbyId);
+}
+
+/** Anzahl der Leute in einem Sprachkanal, -1 = unbekannt (dann wird nie gelöscht) */
+function sprachAnzahl(kanalId: string, guildId: string): number {
+    try {
+        const states = VoiceStateStore.getVoiceStatesForChannel?.(kanalId);
+        if (states) return Object.keys(states).length;
+        const alle = VoiceStateStore.getVoiceStates?.(guildId);
+        if (alle) return (Object.values(alle) as any[]).filter(v => v.channelId === kanalId).length;
+    } catch {
+        // unbekannt
+    }
+    return -1;
+}
+
+async function raumErstellen(guildId: string, userId: string) {
+    if (sprachLaeuft.has(userId)) return;
+    if (Date.now() - (sprachPausen.get(userId) ?? 0) < 8000) return;
+    sprachLaeuft.add(userId);
+
+    try {
+        const raeume = sprachRaeumeLaden();
+
+        // Hat die Person schon einen Raum? Dann dorthin zurückholen statt einen zweiten anzulegen
+        const eigener = raeume.find(r => r.besitzerId === userId && r.guildId === guildId && ChannelStore.getChannel(r.kanalId));
+        if (eigener) {
+            await anfrage(() => RestAPI.patch({ url: `/guilds/${guildId}/members/${userId}`, body: { channel_id: eigener.kanalId } }));
+            return;
+        }
+
+        if (raeume.filter(r => r.guildId === guildId).length >= 25) {
+            throw new Error("Es gibt schon 25 eigene Räume, bitte später noch einmal versuchen.");
+        }
+
+        const lobby: any = ChannelStore.getChannel(settings.store.sprachLobbyId);
+        if (!lobby) throw new Error("Der Lobby-Kanal wurde nicht gefunden.");
+
+        // Rechte der Lobby übernehmen und dem Besitzer das Verwalten seines Raums erlauben
+        const rechte = rechteVon(lobby).filter(o => o.id !== userId);
+        rechte.push({ id: userId, type: 1, allow: RAUM_RECHTE, deny: "0" });
+
+        const kanal = (await anfrage(() => RestAPI.post({
+            url: `/guilds/${guildId}/channels`,
+            body: {
+                name: `Raum von ${anzeigeName(guildId, userId)}`.slice(0, 100),
+                type: 2,
+                parent_id: lobby.parent_id ?? undefined,
+                permission_overwrites: rechte
+            }
+        }))).body;
+
+        sprachRaeumeSpeichern([...sprachRaeumeLaden(), { kanalId: kanal.id, besitzerId: userId, guildId, erstellt: Date.now() }]);
+
+        await pause(300);
+        await anfrage(() => RestAPI.patch({ url: `/guilds/${guildId}/members/${userId}`, body: { channel_id: kanal.id } }));
+        sprachLetzterFehler = "";
+    } catch (e) {
+        sprachLetzterFehler = fehlerText(e);
+        console.error("[MeinPlugin] Sprachraum konnte nicht erstellt werden:", e);
+    } finally {
+        sprachLaeuft.delete(userId);
+        sprachPausen.set(userId, Date.now());
+    }
+}
+
+async function raumLoeschenWennLeer(kanalId: string) {
+    const liste = sprachRaeumeLaden();
+    const raum = liste.find(r => r.kanalId === kanalId);
+    if (!raum) return;
+    if (Date.now() - raum.erstellt < 30_000) return; // frisch erstellt: Besitzer wird gerade hineinverschoben
+
+    const vorhanden = !!ChannelStore.getChannel(kanalId);
+    if (vorhanden && sprachAnzahl(kanalId, raum.guildId) !== 0) return;
+
+    if (vorhanden) {
+        await anfrage(() => RestAPI.delete({ url: `/channels/${kanalId}` })).catch(() => { });
+    }
+    sprachRaeumeSpeichern(sprachRaeumeLaden().filter(r => r.kanalId !== kanalId));
+}
+
+function raumPruefenPlanen(kanalId: string) {
+    const alt = sprachTimer.get(kanalId);
+    if (alt) clearTimeout(alt);
+    sprachTimer.set(kanalId, setTimeout(() => {
+        sprachTimer.delete(kanalId);
+        raumLoeschenWennLeer(kanalId).catch(e => console.error("[MeinPlugin] Sprachraum löschen:", e));
+    }, 4000));
+}
+
+async function sprachAufraeumen() {
+    for (const r of sprachRaeumeLaden()) {
+        try {
+            await raumLoeschenWennLeer(r.kanalId);
+        } catch (e) {
+            console.error("[MeinPlugin] Aufräumen:", e);
+        }
+    }
+}
+
+function sprachEreignis({ voiceStates }: any) {
+    if (!Array.isArray(voiceStates)) return;
+
+    const raumIds = new Set(sprachRaeumeLaden().map(r => r.kanalId));
+    for (const v of voiceStates) {
+        if (sprachBereit() && v.guildId === settings.store.sprachServerId && v.channelId === settings.store.sprachLobbyId) {
+            void raumErstellen(v.guildId, v.userId);
+        }
+        if (v.oldChannelId && raumIds.has(v.oldChannelId)) raumPruefenPlanen(v.oldChannelId);
+    }
+}
+
+function sprachStart() {
+    sprachStop();
+    FluxDispatcher.subscribe("VOICE_STATE_UPDATES", sprachEreignis);
+    sprachStartTimer = setTimeout(() => void sprachAufraeumen(), 30_000);
+    sprachIntervall = setInterval(() => void sprachAufraeumen(), 3 * 60_000);
+}
+
+function sprachStop() {
+    FluxDispatcher.unsubscribe("VOICE_STATE_UPDATES", sprachEreignis);
+    if (sprachStartTimer) clearTimeout(sprachStartTimer);
+    if (sprachIntervall) clearInterval(sprachIntervall);
+    sprachTimer.forEach(t => clearTimeout(t));
+    sprachTimer.clear();
+    sprachStartTimer = null;
+    sprachIntervall = null;
+}
+
+async function sprachBefehl(arg: string, channelId: string, guildId: string | undefined) {
+    const eingabe = arg.trim();
+
+    if (eingabe.toLowerCase() === "aus") {
+        settings.store.sprachAktiv = false;
+        info(channelId, "🎙️ Eigene Sprachkanäle ausgeschaltet. Bestehende Räume werden weiter aufgeräumt, sobald sie leer sind.");
+        return;
+    }
+
+    if (eingabe.toLowerCase() === "status") {
+        const raeume = sprachRaeumeLaden();
+        info(channelId, [
+            sprachBereit()
+                ? `🎙️ Eigene Sprachkanäle sind AN. Lobby: <#${settings.store.sprachLobbyId}>`
+                : "🎙️ Eigene Sprachkanäle sind AUS. Einschalten mit `!sprachlobby`.",
+            `Aktive eigene Räume: ${raeume.length}`,
+            sprachLetzterFehler ? `⚠️ Letzter Fehler: ${entschaerfen(sprachLetzterFehler)}` : ""
+        ].filter(Boolean).join("\n"));
+        return;
+    }
+
+    if (!guildId) throw new Error("Nur auf Servern möglich. Schreibe den Befehl in einem Kanal deines Servers.");
+
+    let lobbyId: string;
+    if (/^\d{17,20}$/.test(eingabe)) {
+        // Vorhandenen Sprachkanal als Lobby verwenden
+        const k: any = ChannelStore.getChannel(eingabe);
+        if (!k || k.guild_id !== guildId || k.type !== 2) throw new Error("Das ist kein Sprachkanal dieses Servers.");
+        lobbyId = k.id;
+    } else {
+        // Lobby automatisch erstellen, in derselben Kategorie wie der aktuelle Kanal
+        const aktuell: any = ChannelStore.getChannel(channelId);
+        const k = (await anfrage(() => RestAPI.post({
+            url: `/guilds/${guildId}/channels`,
+            body: { name: "➕ Erstellen", type: 2, parent_id: aktuell?.parent_id ?? undefined }
+        }))).body;
+        lobbyId = k.id;
+    }
+
+    settings.store.sprachServerId = guildId;
+    settings.store.sprachLobbyId = lobbyId;
+    settings.store.sprachAktiv = true;
+
+    info(channelId, [
+        `✅ Eigene Sprachkanäle sind AN. Lobby: <#${lobbyId}>`,
+        "Wer die Lobby betritt, bekommt automatisch einen eigenen Raum („Raum von …“) und wird hineinverschoben.",
+        "Den Namen ändert der Besitzer selbst (Rechtsklick auf seinen Raum → Kanal bearbeiten). Leere Räume werden gelöscht.",
+        "Das funktioniert nur, solange dein Discord läuft. Du brauchst die Rechte „Kanäle verwalten“ und „Mitglieder verschieben“."
+    ].join("\n"));
+}
+
+/* ------------------------------ Inaktive Kanäle archivieren ------------------------------ */
+
+// Kanäle ohne Nachrichten wandern nach einiger Zeit in die Kategorie "📦 Archiv" am Ende der Liste.
+// Sobald dort wieder jemand schreibt, springen sie in ihre alte Kategorie zurück.
+// Hinweis: Wirklich unsichtbare Kanäle könnten keine neuen Nachrichten empfangen, daher bleiben sie erreichbar.
+type Archiviert = { kanalId: string; parentId: string | null; zeit: number; };
+
+let archivIntervall: ReturnType<typeof setInterval> | null = null;
+let archivTimer: ReturnType<typeof setTimeout> | null = null;
+let archivLaeuft = false;
+let archivLetzterFehler = "";
+const zurueckLaeuft = new Set<string>();
+
+const archivListeLaden = () => jsonListe<Archiviert>(settings.store.archivListe);
+const archivListeSpeichern = (l: Archiviert[]) => { settings.store.archivListe = JSON.stringify(l); };
+const archivAusnahmen = () => jsonListe<string>(settings.store.archivAusnahmen);
+
+function archivBereit(): boolean {
+    return !!(settings.store.archivAktiv && settings.store.archivServerId);
+}
+
+function letzteAktivitaet(c: any): number {
+    return snowflakeZeit(c.lastMessageId ?? c.last_message_id ?? c.id);
+}
+
+/** Kanäle, die nie archiviert werden: Protokoll, Verify, Willkommen, Zonen, Lobby, Regeln, System */
+function geschuetzteKanaele(guildId: string): Set<string> {
+    const g: any = GuildStore.getGuild(guildId);
+    const ids = [
+        settings.store.auditKanalId,
+        TOR.kanalId,
+        settings.store.willkommenKanalId,
+        settings.store.sprachLobbyId,
+        settings.store.archivKategorieId,
+        g?.rulesChannelId,
+        g?.publicUpdatesChannelId,
+        g?.systemChannelId,
+        ...zonenLaden().map(z => z.kanalId),
+        ...archivAusnahmen()
+    ];
+    return new Set(ids.filter((x): x is string => !!x));
+}
+
+async function archivKategorie(guildId: string): Promise<string> {
+    const id = settings.store.archivKategorieId;
+    if (id && ChannelStore.getChannel(id)) return id;
+
+    const k = (await anfrage(() => RestAPI.post({
+        url: `/guilds/${guildId}/channels`,
+        body: { name: "📦 Archiv", type: 4 }
+    }))).body;
+    settings.store.archivKategorieId = k.id;
+    return k.id;
+}
+
+async function archivPruefen() {
+    if (!archivBereit() || archivLaeuft) return;
+    archivLaeuft = true;
+
+    try {
+        const gid = settings.store.archivServerId;
+        const tage = Math.min(365, Math.max(1, Number(settings.store.archivTage) || 14));
+        const grenze = Date.now() - tage * 86_400_000;
+        const geschuetzt = geschuetzteKanaele(gid);
+        const schonArchiviert = new Set(archivListeLaden().map(e => e.kanalId));
+        const katId = settings.store.archivKategorieId;
+
+        // Vorauswahl mit den Daten, die Discord schon kennt: die ältesten zuerst, höchstens 10 pro Durchgang
+        const kandidaten = kanaeleVon(gid)
+            .filter(c => (c.type === 0 || c.type === 5)
+                && !geschuetzt.has(c.id)
+                && !schonArchiviert.has(c.id)
+                && c.parent_id !== katId
+                && letzteAktivitaet(c) < grenze)
+            .sort((a, b) => letzteAktivitaet(a) - letzteAktivitaet(b))
+            .slice(0, 10);
+
+        const archiviert: string[] = [];
+        for (const c of kandidaten) {
+            // Sicherheitsprüfung: wirklich die letzte Nachricht beim Server erfragen
+            await pause(400);
+            const res = await anfrage(() => RestAPI.get({ url: `/channels/${c.id}/messages`, query: { limit: 1 } })).catch(() => null);
+            if (!res) continue;
+            const letzte = res.body?.[0]?.id ? snowflakeZeit(res.body[0].id) : snowflakeZeit(c.id);
+            if (letzte >= grenze) continue;
+
+            const kat = await archivKategorie(gid);
+            if (kanaeleVon(gid).filter(k => k.parent_id === kat).length >= 50) {
+                archivLetzterFehler = "Die Kategorie „Archiv“ ist voll (höchstens 50 Kanäle).";
+                break;
+            }
+
+            await pause(400);
+            await anfrage(() => RestAPI.patch({ url: `/channels/${c.id}`, body: { parent_id: kat, lock_permissions: false } }));
+            archivListeSpeichern([...archivListeLaden(), { kanalId: c.id, parentId: c.parent_id ?? null, zeit: Date.now() }]);
+            archiviert.push(c.id);
+        }
+
+        if (archiviert.length) {
+            archivLetzterFehler = "";
+            const text = `Archiviert (seit ${tage} Tagen ohne Nachricht): ${archiviert.map(id => `<#${id}>`).join(", ")}`;
+            showNotification({ title: "Kanäle archiviert", body: `${archiviert.length} Kanal/Kanäle ins Archiv verschoben.` });
+            auditSenden(`📦 **${text}**`);
+        }
+    } catch (e) {
+        archivLetzterFehler = fehlerText(e);
+        console.error("[MeinPlugin] Archivierung fehlgeschlagen:", e);
+    } finally {
+        archivLaeuft = false;
+    }
+}
+
+async function kanalZurueck(eintrag: Archiviert) {
+    if (zurueckLaeuft.has(eintrag.kanalId)) return;
+    zurueckLaeuft.add(eintrag.kanalId);
+
+    try {
+        // Gibt es die alte Kategorie noch? Sonst ganz nach oben
+        const parent = eintrag.parentId && ChannelStore.getChannel(eintrag.parentId) ? eintrag.parentId : null;
+        await anfrage(() => RestAPI.patch({ url: `/channels/${eintrag.kanalId}`, body: { parent_id: parent, lock_permissions: false } }));
+        archivListeSpeichern(archivListeLaden().filter(e => e.kanalId !== eintrag.kanalId));
+        auditSenden(`📤 **Kanal reaktiviert:** <#${eintrag.kanalId}> ist wieder aktiv und zurück in seiner Kategorie.`);
+    } catch (e) {
+        console.error("[MeinPlugin] Kanal konnte nicht zurückgeholt werden:", e);
+    } finally {
+        zurueckLaeuft.delete(eintrag.kanalId);
+    }
+}
+
+/** Schreibt jemand in einem archivierten Kanal, kommt er zurück (auch wenn das Archiv sonst aus ist) */
+function archivNachricht({ message, channelId, optimistic }: any) {
+    if (optimistic) return;
+    const kanal: string | undefined = channelId ?? message?.channel_id;
+    if (!kanal) return;
+    const eintrag = archivListeLaden().find(e => e.kanalId === kanal);
+    if (eintrag) void kanalZurueck(eintrag);
+}
+
+function archivPlanen(ms = 2000) {
+    if (archivTimer) clearTimeout(archivTimer);
+    archivTimer = setTimeout(() => void archivPruefen(), ms);
+}
+
+function archivStart() {
+    archivStop();
+    FluxDispatcher.subscribe("MESSAGE_CREATE", archivNachricht);
+    archivPlanen(30_000);
+    archivIntervall = setInterval(() => archivPlanen(0), 60 * 60_000);
+}
+
+function archivStop() {
+    FluxDispatcher.unsubscribe("MESSAGE_CREATE", archivNachricht);
+    if (archivTimer) clearTimeout(archivTimer);
+    if (archivIntervall) clearInterval(archivIntervall);
+    archivTimer = null;
+    archivIntervall = null;
+}
+
+async function archivBefehl(arg: string, channelId: string, guildId: string | undefined) {
+    const teile = arg.trim().split(/\s+/);
+    const unter = (teile[0] ?? "").toLowerCase();
+
+    switch (unter) {
+        case "an": {
+            if (!guildId) throw new Error("Nur auf Servern möglich.");
+            const tage = teile[1] ? Math.floor(Number(teile[1])) : Number(settings.store.archivTage) || 14;
+            if (!Number.isFinite(tage) || tage < 1 || tage > 365) throw new Error("Nutzung: !archiv an [Tage, 1 bis 365]");
+
+            settings.store.archivServerId = guildId;
+            settings.store.archivTage = tage;
+            settings.store.archivAktiv = true;
+            archivPlanen(2000);
+
+            info(channelId, [
+                `📦 Archivierung ist AN: Text-Kanäle ohne Nachricht seit **${tage} Tagen** wandern in die Kategorie „Archiv“ am Ende der Liste.`,
+                "Schreibt dort jemand wieder, springt der Kanal in seine alte Kategorie zurück.",
+                "Nie archiviert werden Regeln, System-, Verify-, Willkommens-, Protokoll- und Zonen-Kanäle. Weitere nimmst du mit `!archiv ausnahme` im jeweiligen Kanal aus.",
+                "Ich prüfe gleich und danach jede Stunde. Höchstens 10 Kanäle pro Durchgang."
+            ].join("\n"));
+            return;
+        }
+
+        case "aus": {
+            settings.store.archivAktiv = false;
+            info(channelId, "📦 Archivierung ausgeschaltet. Bereits archivierte Kanäle kommen weiter zurück, sobald dort geschrieben wird, oder alle auf einmal mit `!archiv zurueck`.");
+            return;
+        }
+
+        case "jetzt": {
+            if (!archivBereit()) throw new Error("Die Archivierung ist aus. Einschalten mit `!archiv an`.");
+            archivPlanen(0);
+            info(channelId, "🔄 Ich prüfe die Kanäle jetzt.");
+            return;
+        }
+
+        case "ausnahme": {
+            const liste = archivAusnahmen();
+            const drin = liste.includes(channelId);
+            settings.store.archivAusnahmen = JSON.stringify(drin ? liste.filter(x => x !== channelId) : [...liste, channelId]);
+            info(channelId, drin
+                ? "📦 Dieser Kanal kann wieder archiviert werden."
+                : "📦 Dieser Kanal wird nie archiviert.");
+            return;
+        }
+
+        case "liste": {
+            const liste = archivListeLaden();
+            info(channelId, liste.length
+                ? ["📦 **Archivierte Kanäle**", ...liste.map(e => `• <#${e.kanalId}> (seit ${new Date(e.zeit).toLocaleDateString("de-DE")})`)].join("\n")
+                : "📦 Es ist gerade kein Kanal archiviert.");
+            return;
+        }
+
+        case "zurueck": {
+            const liste = archivListeLaden();
+            if (!liste.length) {
+                info(channelId, "📦 Es ist gerade kein Kanal archiviert.");
+                return;
+            }
+            info(channelId, `📤 Hole ${liste.length} Kanäle aus dem Archiv zurück …`);
+            void (async () => {
+                for (const e of liste) {
+                    await pause(500);
+                    await kanalZurueck(e);
+                }
+                info(channelId, "✅ Alle Kanäle sind zurück in ihren Kategorien.");
+            })();
+            return;
+        }
+
+        case "status": {
+            info(channelId, [
+                archivBereit()
+                    ? `📦 Archivierung ist AN (nach ${Number(settings.store.archivTage) || 14} Tagen ohne Nachricht).`
+                    : "📦 Archivierung ist AUS. Einschalten mit `!archiv an [Tage]`.",
+                `Archivierte Kanäle: ${archivListeLaden().length} | Ausnahmen: ${archivAusnahmen().length}`,
+                archivLetzterFehler ? `⚠️ Letzter Fehler: ${entschaerfen(archivLetzterFehler)}` : ""
+            ].filter(Boolean).join("\n"));
+            return;
+        }
+
+        default:
+            throw new Error([
+                "Nutzung: `!archiv an [Tage]` | `aus` | `status` | `jetzt` | `liste` | `zurueck` | `ausnahme`",
+                "Beispiel: `!archiv an 14` archiviert Kanäle, in denen 14 Tage nichts geschrieben wurde."
+            ].join("\n"));
+    }
+}
+
 /* ------------------------------------ Torwächter ------------------------------------ */
 
 const verarbeitet = new Set<string>();
-let letzterHandshake = 0;
+const letzteHandshakes = new Map<string, number>();
+let handshakeTimer: ReturnType<typeof setTimeout> | null = null;
+const TOR_KANAL_NAME = "plugin-verify";
 let torTimer: ReturnType<typeof setTimeout> | null = null;
 
 function torKonfiguriert(): boolean {
@@ -1538,29 +2113,55 @@ async function hmacHex(text: string): Promise<string> {
     return Array.from(sig, b => b.toString(16).padStart(2, "0")).join("");
 }
 
+type TorZiel = { guildId: string; kanalId: string; rolleId: string; };
+
+/** Server, an die ein Nachweis gehen kann: der eigene (Einstellungen) und alle mit einem "plugin-verify"-Kanal samt Marker im Thema */
+function torZiele(): TorZiel[] {
+    const ziele = new Map<string, TorZiel>();
+    if (TOR.serverId && TOR.kanalId && TOR.rolleId) {
+        ziele.set(TOR.serverId, { guildId: TOR.serverId, kanalId: TOR.kanalId, rolleId: TOR.rolleId });
+    }
+
+    try {
+        const alle: any = (GuildStore as any).getGuilds?.() ?? {};
+        for (const g of Object.values(alle) as any[]) {
+            if (!g?.id || ziele.has(g.id)) continue;
+            const k = kanaeleVon(g.id).find(c => c.type === 0 && c.name === TOR_KANAL_NAME);
+            const m = /\[MeinPlugin-Tor:(\d{17,20})\]/.exec(String(k?.topic ?? ""));
+            if (k && m) ziele.set(g.id, { guildId: g.id, kanalId: k.id, rolleId: m[1] });
+        }
+    } catch {
+        // keine weiteren Server bekannt
+    }
+    return [...ziele.values()];
+}
+
 /** Mitglied-Seite: sendet den Nachweis (an deine Nutzer-ID gebunden, kann nicht kopiert werden) */
-async function handshakeSenden() {
+async function handshakeSenden(kanalId: string) {
     const me = UserStore.getCurrentUser().id;
     const ts = Date.now();
     const content = `TOR1:${ts}:${await hmacHex(`${me}:${ts}`)}`;
     uebersprungen.add(content); // nicht verschlüsseln
-    await sendMessage(TOR.kanalId, { content });
+    await sendMessage(kanalId, { content });
 }
 
-/** Mitglied-Seite: sendet den Nachweis, falls man die Rolle noch nicht hat */
+/** Mitglied-Seite: schickt auf jedem passenden Server den Nachweis, falls man die Rolle noch nicht hat */
 async function handshakeWennNoetig() {
-    if (!torKonfiguriert()) return;
-
+    if (!settings.store.torGeheimnis) return;
     const me = UserStore.getCurrentUser();
-    const guild = GuildStore.getGuild(TOR.serverId);
-    if (!me || !guild || guild.ownerId === me.id) return;
+    if (!me) return;
 
-    const member = GuildMemberStore.getMember(TOR.serverId, me.id);
-    if (!member || member.roles.includes(TOR.rolleId)) return;
+    for (const ziel of torZiele()) {
+        const guild: any = GuildStore.getGuild(ziel.guildId);
+        if (!guild || guild.ownerId === me.id) continue;
 
-    if (Date.now() - letzterHandshake < 600_000) return; // höchstens alle 10 Minuten
-    letzterHandshake = Date.now();
-    await handshakeSenden();
+        const member: any = GuildMemberStore.getMember(ziel.guildId, me.id);
+        if (!member || member.roles.includes(ziel.rolleId)) continue;
+
+        if (Date.now() - (letzteHandshakes.get(ziel.guildId) ?? 0) < 600_000) continue; // höchstens alle 10 Minuten
+        letzteHandshakes.set(ziel.guildId, Date.now());
+        await handshakeSenden(ziel.kanalId);
+    }
 }
 
 /** Prüfer-Seite: kontrolliert einen Nachweis und vergibt die Rolle */
@@ -1591,20 +2192,27 @@ function onMessageCreate({ message, optimistic }: any) {
     handshakePruefen(message).catch(e => console.error("[MeinPlugin] Torwächter:", e));
 }
 
-function onGuildCreate({ guild }: any) {
-    if (!TOR.serverId || guild?.id !== TOR.serverId) return;
-    setTimeout(() => handshakeWennNoetig().catch(e => console.error("[MeinPlugin] Torwächter:", e)), 5000);
+function handshakePlanen(ms = 5000) {
+    if (handshakeTimer) clearTimeout(handshakeTimer);
+    handshakeTimer = setTimeout(
+        () => handshakeWennNoetig().catch(e => console.error("[MeinPlugin] Torwächter:", e)),
+        ms
+    );
+}
+
+function onGuildCreate() {
+    handshakePlanen();
 }
 
 function torStart() {
     torStop();
-    if (!torKonfiguriert()) return;
+    if (!settings.store.torGeheimnis) return;
 
-    // Nach dem Start: eigenen Nachweis senden und verpasste Nachweise nachholen
+    // Nach dem Start: eigenen Nachweis senden und (als Prüfer) verpasste Nachweise nachholen
     torTimer = setTimeout(async () => {
         try {
             await handshakeWennNoetig();
-            if (settings.store.torwaechter) {
+            if (settings.store.torwaechter && torKonfiguriert()) {
                 const res = await RestAPI.get({ url: `/channels/${TOR.kanalId}/messages`, query: { limit: 50 } });
                 for (const m of res.body) await handshakePruefen(m);
             }
@@ -1616,7 +2224,202 @@ function torStart() {
 
 function torStop() {
     if (torTimer) clearTimeout(torTimer);
+    if (handshakeTimer) clearTimeout(handshakeTimer);
     torTimer = null;
+    handshakeTimer = null;
+}
+
+/* ------------------------------ Kanäle nur für Plugin-Nutzer ------------------------------ */
+
+// Ein geschützter Kanal ist nur für die Rolle "Plugin-Nutzer" sichtbar. Diese Rolle bekommt man automatisch,
+// wenn das eigene Plugin den Nachweis (Torwächter) in den Kanal "plugin-verify" schickt.
+type PluginKanal = {
+    kanalId: string;
+    guildId: string;
+    alle: { allow: string; deny: string; } | null;   // vorherige Rechte von @everyone, zum Wiederherstellen
+    rolle: { allow: string; deny: string; } | null;  // vorherige Rechte der Plugin-Rolle
+};
+
+const SEHEN = 1n << 10n;
+const VERIFY_RECHTE = (1n << 10n) | (1n << 11n) | (1n << 16n);                  // sehen, schreiben, Verlauf lesen
+const TEXT_ZUGANG = (1n << 6n) | (1n << 10n) | (1n << 11n) | (1n << 16n);       // dazu Reaktionen
+const SPRACH_ZUGANG = (1n << 10n) | (1n << 20n) | (1n << 21n);                  // sehen, verbinden, sprechen
+
+const pluginKanaeleLaden = () => jsonListe<PluginKanal>(settings.store.pluginKanaele);
+const pluginKanaeleSpeichern = (l: PluginKanal[]) => { settings.store.pluginKanaele = JSON.stringify(l); };
+
+function zufallsGeheimnis(): string {
+    const bytes = crypto.getRandomValues(new Uint8Array(18));
+    return Array.from(bytes, b => b.toString(36).padStart(2, "0")).join("");
+}
+
+function ueberschreibung(kanal: any, id: string): { allow: bigint; deny: bigint; } | null {
+    const o = (kanal?.permissionOverwrites ?? {})[id];
+    return o ? { allow: BigInt(String(o.allow)), deny: BigInt(String(o.deny)) } : null;
+}
+
+const alsText = (u: { allow: bigint; deny: bigint; } | null) =>
+    u ? { allow: u.allow.toString(), deny: u.deny.toString() } : null;
+
+async function rechteSetzen(kanalId: string, id: string, allow: bigint, deny: bigint) {
+    await pause(300);
+    await anfrage(() => RestAPI.put({
+        url: `/channels/${kanalId}/permissions/${id}`,
+        body: { type: 0, allow: allow.toString(), deny: deny.toString() }
+    }));
+}
+
+async function rechteEntfernen(kanalId: string, id: string) {
+    await pause(300);
+    await anfrage(() => RestAPI.delete({ url: `/channels/${kanalId}/permissions/${id}` })).catch(() => { });
+}
+
+/** Richtet den Torwächter für diesen Server automatisch ein (Rolle, Verify-Kanal, Geheimnis), falls noch nicht geschehen */
+async function torEinrichten(guildId: string, sag: (t: string) => void): Promise<{ rolleId: string; geheimnis: string; }> {
+    if (TOR.serverId && TOR.serverId !== guildId) {
+        throw new Error("Der Torwächter ist schon für einen anderen Server eingerichtet. Aktuell geht das nur für einen Server.");
+    }
+
+    // Rolle "Plugin-Nutzer"
+    let rolleId = TOR.rolleId;
+    const bekannte = rollenVon(guildId);
+    const rolleDa = !!rolleId && (Object.keys(bekannte).length === 0 || !!bekannte[rolleId]);
+    if (!rolleDa) {
+        await pause(400);
+        const r = (await anfrage(() => RestAPI.post({
+            url: `/guilds/${guildId}/roles`,
+            body: { name: "Plugin-Nutzer", permissions: "0", color: 0x9B59B6, mentionable: false }
+        }))).body;
+        rolleId = r.id;
+        settings.store.torRolleId = rolleId;
+        sag("🏷️ Rolle „Plugin-Nutzer“ angelegt.");
+    }
+
+    // Verify-Kanal: für alle sichtbar. Fremde Plugins finden ihn am Namen und am Marker im Thema.
+    const marker = `[MeinPlugin-Tor:${rolleId}]`;
+    const thema = `Nur für Leute mit dem Plugin: Dein Plugin schickt hier automatisch einen Nachweis. ${marker}`;
+    let kanalId = TOR.kanalId;
+    const vorhanden: any = kanalId ? ChannelStore.getChannel(kanalId) : null;
+
+    if (!vorhanden) {
+        await pause(400);
+        const k = (await anfrage(() => RestAPI.post({
+            url: `/guilds/${guildId}/channels`,
+            body: {
+                name: TOR_KANAL_NAME,
+                type: 0,
+                topic: thema,
+                permission_overwrites: [
+                    { id: guildId, type: 0, allow: VERIFY_RECHTE.toString(), deny: "0" },
+                    { id: rolleId, type: 0, allow: "0", deny: SEHEN.toString() } // nach der Freischaltung ausgeblendet
+                ]
+            }
+        }))).body;
+        kanalId = k.id;
+        sag("📁 Kanal „plugin-verify“ angelegt.");
+    } else if (!String(vorhanden.topic ?? "").includes(marker) || vorhanden.name !== TOR_KANAL_NAME) {
+        await pause(400);
+        await anfrage(() => RestAPI.patch({ url: `/channels/${kanalId}`, body: { name: TOR_KANAL_NAME, topic: thema } }));
+    }
+
+    settings.store.torServerId = guildId;
+    settings.store.torKanalId = kanalId;
+    settings.store.torwaechter = true;
+
+    let geheimnis = settings.store.torGeheimnis;
+    if (!geheimnis) {
+        geheimnis = zufallsGeheimnis();
+        settings.store.torGeheimnis = geheimnis;
+    }
+    torStart();
+
+    return { rolleId, geheimnis };
+}
+
+async function pluginKanalSperren(kanalId: string, sag: (t: string) => void) {
+    const k: any = ChannelStore.getChannel(kanalId);
+    if (!k?.guild_id) throw new Error("Kanal nicht gefunden. Schreibe den Befehl auf dem Server.");
+    if (![0, 5, 2, 13].includes(k.type)) throw new Error("Geschützt werden können nur Text- und Sprachkanäle.");
+    if (kanalId === TOR.kanalId) throw new Error("Der Verify-Kanal muss für alle sichtbar bleiben.");
+    if (pluginKanaeleLaden().some(e => e.kanalId === kanalId)) throw new Error("Dieser Kanal ist schon geschützt.");
+
+    const guildId: string = k.guild_id;
+    const { rolleId, geheimnis } = await torEinrichten(guildId, sag);
+
+    const sprache = k.type === 2 || k.type === 13;
+    const zugang = sprache ? SPRACH_ZUGANG : TEXT_ZUGANG;
+
+    // Alte Rechte merken, damit sich alles wieder genau so herstellen lässt
+    const frischer: any = ChannelStore.getChannel(kanalId);
+    const alleAlt = ueberschreibung(frischer, guildId);
+    const rolleAlt = ueberschreibung(frischer, rolleId);
+
+    const a = alleAlt ?? { allow: 0n, deny: 0n };
+    await rechteSetzen(kanalId, guildId, a.allow & ~SEHEN, a.deny | SEHEN);
+
+    const r = rolleAlt ?? { allow: 0n, deny: 0n };
+    await rechteSetzen(kanalId, rolleId, r.allow | zugang, r.deny & ~zugang);
+
+    pluginKanaeleSpeichern([
+        ...pluginKanaeleLaden(),
+        { kanalId, guildId, alle: alsText(alleAlt), rolle: alsText(rolleAlt) }
+    ]);
+
+    sag([
+        `🔐 <#${kanalId}> ist jetzt nur noch für Leute mit dem Plugin zugänglich.`,
+        "So kommen Freunde hinein: Plugin installieren und in den Plugin-Einstellungen das Torwächter-Geheimnis eintragen:",
+        `\`${geheimnis}\``,
+        "Sobald sie auf deinem Server sind (oder Discord starten), schickt ihr Plugin den Nachweis in „plugin-verify“. Du schaltest sie automatisch frei, solange dein Discord läuft.",
+        "Das Geheimnis bekommen nur Leute, die rein sollen. Aufheben kannst du den Schutz mit `!pluginkanal aus`."
+    ].join("\n"));
+}
+
+async function pluginKanalFreigeben(kanalId: string) {
+    const liste = pluginKanaeleLaden();
+    const e = liste.find(x => x.kanalId === kanalId);
+    if (!e) throw new Error("Dieser Kanal ist nicht geschützt.");
+
+    if (ChannelStore.getChannel(kanalId)) {
+        if (e.alle) await rechteSetzen(kanalId, e.guildId, BigInt(e.alle.allow), BigInt(e.alle.deny));
+        else await rechteEntfernen(kanalId, e.guildId);
+
+        const rolleId = TOR.rolleId;
+        if (rolleId) {
+            if (e.rolle) await rechteSetzen(kanalId, rolleId, BigInt(e.rolle.allow), BigInt(e.rolle.deny));
+            else await rechteEntfernen(kanalId, rolleId);
+        }
+    }
+    pluginKanaeleSpeichern(liste.filter(x => x.kanalId !== kanalId));
+}
+
+async function pluginKanalBefehl(arg: string, channelId: string, guildId: string | undefined) {
+    const teile = arg.trim().split(/\s+/).filter(Boolean);
+    const erstes = (teile[0] ?? "").toLowerCase();
+
+    const kanalAus = (text?: string): string => {
+        const m = /^<#(\d{17,20})>$/.exec(text ?? "") ?? /^(\d{17,20})$/.exec(text ?? "");
+        return m ? m[1] : channelId;
+    };
+
+    if (erstes === "liste") {
+        const liste = pluginKanaeleLaden();
+        info(channelId, liste.length
+            ? ["🔐 **Kanäle nur für Plugin-Nutzer**", ...liste.map(e => `• <#${e.kanalId}>`)].join("\n")
+            : "🔐 Es ist noch kein Kanal geschützt. Schreibe `!pluginkanal` in dem Kanal, der geschützt werden soll.");
+        return;
+    }
+
+    if (erstes === "aus") {
+        const id = kanalAus(teile[1]);
+        await pluginKanalFreigeben(id);
+        info(channelId, `🔓 <#${id}> ist wieder so wie vorher zugänglich.`);
+        return;
+    }
+
+    if (!guildId) throw new Error("Nur auf Servern möglich. Schreibe den Befehl in dem Kanal, der geschützt werden soll.");
+
+    const rest = erstes === "an" ? teile.slice(1) : teile;
+    await pluginKanalSperren(kanalAus(rest[0]), t => info(channelId, t));
 }
 
 /* ------------------------------------ Auto-Update ------------------------------------ */
@@ -1712,6 +2515,8 @@ export default definePlugin({
         torStart();
         auditStart();
         zonenStart();
+        sprachStart();
+        archivStart();
     },
 
     stop() {
@@ -1725,5 +2530,7 @@ export default definePlugin({
         torStop();
         auditStop();
         zonenStop();
+        sprachStop();
+        archivStop();
     }
 });
